@@ -1,0 +1,76 @@
+# ============================================================
+# Generación de Escritura a Mano — LSTM + MDN + Soft Attention
+# Entorno: Python 3.12 | CUDA 12.x | WSL2 | NVIDIA RTX
+# ============================================================
+#
+# ============================================================
+# PASO 0 — CONFIGURAR WSL2 CON SOPORTE GPU (Windows 10/11)
+# ============================================================
+#
+# 0.1 Habilitar WSL2 (PowerShell como Administrador):
+#       wsl --install
+#       wsl --set-default-version 2
+#
+# 0.2 Instalar una distro (Ubuntu 22.04 recomendado):
+#       wsl --install -d Ubuntu-22.04
+#
+# 0.3 Instalar el driver NVIDIA con soporte WSL en Windows
+#     (NO instalar CUDA dentro de Windows — solo el driver):
+#       https://www.nvidia.com/Download/index.aspx
+#       Versión mínima del driver: 525.x para CUDA 12.x
+#
+# 0.4 Verificar que la GPU es visible desde WSL:
+#       nvidia-smi
+#     Debe mostrar la GPU y la versión de CUDA disponible.
+#
+# 0.5 Instalar CUDA Toolkit 12.1 dentro de WSL (Ubuntu):
+#       wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+#       sudo dpkg -i cuda-keyring_1.1-1_all.deb
+#       sudo apt update
+#       sudo apt install -y cuda-toolkit-12-1
+#
+# 0.6 Añadir CUDA al PATH (en ~/.bashrc):
+#       export PATH=/usr/local/cuda-12.1/bin:$PATH
+#       export LD_LIBRARY_PATH=/usr/local/cuda-12.1/lib64:$LD_LIBRARY_PATH
+#       source ~/.bashrc
+#
+# 0.7 Verificar compilador CUDA:
+#       nvcc --version
+#
+# ============================================================
+# PASO 1 — ENTORNO PYTHON
+# ============================================================
+#
+# 1.1 Instalar Python 3.12 en WSL:
+#       sudo apt install -y python3.12 python3.12-venv python3-pip
+#
+# 1.2 Crear y activar entorno virtual:
+#       python3.12 -m venv .venv
+#       source .venv/bin/activate
+#
+# ============================================================
+# PASO 2 — INSTALAR PYTORCH CON CUDA
+# ============================================================
+#
+# PyTorch requiere su propio índice — NO usar pip install directo:
+#   pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cu121
+#
+# Verificar que CUDA está disponible tras la instalación:
+#   python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+#   Resultado esperado: True | NVIDIA GeForce (tu GPU)
+#
+# ============================================================
+# PASO 3 — INSTALAR DEPENDENCIAS DEL PROYECTO
+# ============================================================
+#
+#   pip install -r requirements.txt
+#
+
+# --- PyTorch (ver instrucciones PASO 2) ---
+torch==2.3.1
+
+# --- Cómputo numérico ---
+numpy==1.26.4           # PyTorch 2.3.x no es compatible con NumPy 2.x en todas las ops
+
+# --- Visualización ---
+matplotlib==3.9.2
