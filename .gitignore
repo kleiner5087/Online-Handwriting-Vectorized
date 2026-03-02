@@ -1,0 +1,12 @@
+# Ignorar carpetas de datos
+debug/
+results/
+venv/
+
+# Ignorar cachés de Python
+__pycache__/
+*.py[cod]
+
+# Ignorar archivos específicos en la raíz
+*.png
+*.pt
