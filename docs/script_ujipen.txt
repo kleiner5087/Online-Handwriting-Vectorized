@@ -1,0 +1,62 @@
+INFORME TECNICO DE PROCESAMIENTO DE DATOS: UJIPEN.PY
+
+RESUMEN OPERATIVO
+El script UJIPen.py actua como el motor de preparacion de datos para un modelo generativo basado en vectores. 
+Su funcion principal es tomar coordenadas absolutas de trazos manuscritos, ensamblarlas dinamicamente en palabras 
+completas y transformarlas en secuencias de movimientos relativos, garantizando que los tensores resultantes esten 
+estabilizados matematicamente para el entrenamiento.
+
+1. CARGA DE DATASET Y VOCABULARIO
+El sistema lee el archivo de texto secuencialmente y mapea entidades HTML a caracteres reales, como acentos y eñes. 
+En la prueba, el script cargo exitosamente 11640 muestras distribuidas en 97 clases o caracteres unicos. Ademas, 
+inicializa un vocabulario inmenso de 819392 palabras, el cual sirve como base para generar muestras de entrenamiento 
+con sentido semantico real.
+
+2. SINTESIS DE PALABRAS Y HEURISTICA DE LINEA BASE
+Dado que el dataset original contiene letras aisladas, el script debe crear palabras artificiales concatenando los 
+trazos horizontalmente. Lo hace calculando la caja delimitadora (bounding box) de cada letra.
+
+El diagnostico revela que la heuristica de linea base funciona a la perfeccion. En la palabra de prueba "ag", la letra 
+"a" mantiene sus coordenadas verticales estrictamente negativas (de -600.66 a 0.00), apoyandose exactamente en el suelo
+o linea base. Sin embargo, al procesar la letra "g" (una letra descendente), el sistema empuja su limite inferior un 
+30 por ciento hacia abajo, haciendo que sus valores verticales crucen hacia el lado positivo, llegando hasta 254.61. Este 
+ajuste reproduce con precision la forma en que los humanos escribimos letras con cola, manteniendo un espaciado horizontal 
+de 20 unidades entre cada caracter.
+
+3. NORMALIZACION DE DATOS
+Para evitar la destruccion de los datos por doble normalizacion que vimos en depuraciones pasadas donde los valores se 
+aplastaban cerca de -1.0, el script ahora implementa una estrategia mucho mas limpia. Primero, calcula la desviacion estandar 
+global de los movimientos: 49.04 para delta x, y 69.91 para delta y.
+
+La clave de este paso es que el script ignora deliberadamente la media. Al dividir unicamente por la desviacion estandar, 
+reduce la escala de los valores para facilitar el aprendizaje de la red neuronal, pero preserva la direccion original de 
+los trazos, algo critico para que el modelo sepa hacia donde mover la pluma.
+
+4. TRANSFORMACION DE COORDENADAS A DELTAS
+El modelo no puede aprender de coordenadas absolutas en un lienzo infinito; necesita instrucciones relativas de desplazamiento 
+paso a paso. La funcion encargada toma los puntos originales (por ejemplo, saltar de X=76.32 a X=67.11) y calcula la diferencia 
+exacta entre ellos.
+
+El tensor resultante tiene dimensiones tridimensionales por cada paso de tiempo. El diagnostico confirma la siguiente 
+estructura para los vectores generados:
+
+* Vector de inicio: El primer elemento de toda secuencia es siempre un Token SOS (Start Of Sequence) representado por el vector 
+[0.0, 0.0, 1.0].
+* Trazos continuos: Los siguientes vectores contienen los valores delta x y delta y ya divididos por la desviacion estandar, 
+acompañados de un 0.0 en la tercera posicion, indicando que la pluma esta tocando el papel.
+* Levantamiento de pluma: Cuando un trazo termina, la tercera posicion cambia a 1.0 (Pen Lift), instruyendo al modelo a 
+levantar el trazo antes de iniciar el siguiente.
+
+Ademas, el recorte de seguridad (clipping) configurado entre -20.0 y 20.0 se mantiene inactivo en condiciones normales, ya que 
+los valores de la muestra oscilaron entre -0.79 y 0.76, operando en un rango matematicamente seguro que previene la explosion de gradientes.
+
+5. GENERACION DINAMICA EN EL DATALOADER
+Para maximizar la generalizacion del modelo y compensar la escasez inicial de datos, el sistema no entrega el mismo dataset en 
+cada iteracion. Alterna dinamicamente entre dos fuentes:
+
+* Palabras del diccionario: En la muestra de 100 llamadas, el 66 por ciento de las veces selecciono palabras reales.
+* Cadenas aleatorias: El 34 por ciento restante genero secuencias de letras al azar.
+Esta proporcion (cercana al 70/30 programado) obliga al modelo a aprender transiciones mecanicas complejas entre letras que no 
+suelen ir juntas, en lugar de solo memorizar palabras comunes.
+
+FIN DEL INFORME
