@@ -1,0 +1,42 @@
+Desarrollar un sistema de Síntesis de Escritura Manuscrita Online (Online Handwriting Synthesis) basado en Redes Neuronales Recurrentes (LSTM) y Mixture Density Networks (MDN). El objetivo es transicionar de un modelo generativo basado en píxeles (Offline GAN) a uno basado en trayectorias vectoriales (Delta x, Delta y, p). El pipeline consiste en la extracción de esqueletos mediante morfología matemática a partir de fuentes escaneadas, la generación de un dataset de secuencias temporales y la aplicación de Style Transfer para replicar la morfología y ligaduras específicas del usuario en la generación de texto infinito con resolución independiente.
+
+1. Interfaz de escritura
+Crear una herramienta de captura de trazos (coordenadas x, y, p) para usar en una tablet con lapiz. Se planea capturar tanto palabras como letras individuales. 
+Usar json para guardar los trazos.
+
+1v2.  A la par de esto se entrena un modelo con un dataset de coordenadas, se arman palabras artificiales para entrenar el modelo. La idea es 
+ realizar fine tuning con los trazos capturados en el punto 1.
+
+-----
+5. Red Neuronal Recurrente (LSTM + MDN)
+Objetivo:
+Entrenar un modelo que aprenda a escribir, mediante una RNN de memoria a corto y largo plazo (Long Short-Term Memory) para predecir el siguiente punto y una MDN que defina una nube de probabilidades para aprender las variaciones naturales de la escritura. 
+
+Funcionamiento:
+A. El Codificador de Texto
+Toma una frase ("hola") y la convertirá en una "ventana" que se desliza sobre las letras. Usa un mecanismo de Atención Suave (Soft Attention). A medida que la red dibuja, la atención se desplaza de la 'h' a la 'o'.Matemática: Calcula un vector de "gravedad" $\phi(t)$ que dice cuánto importa cada letra de la frase en el tiempo actual $t$.
+
+B. El cerebro LSTM
+Durante el entrenamiento, el LSTM es el que guarda el contexto. En la entrada recibe el punto anterior (x_{t-1}, y_{t-1}, p_{t-1}) y el contexto de la ventana de atención (la letra actual); en la salida devuelve un estado oculto que contiene la "intención" del siguiente movimiento.
+*A revision: Usar 2 o 3 capas de LSTM apiladas con aproximadamente 256 o 400 unidades ocultas cada una
+
+C. La Salida Probabilística (MDN)
+La MDN predice parámetros de una mezcla de Gaussianas Bivariadas. La red no aprende una coordenada exacta, aprende una Diana de Tiro (Distribución de Probabilidad). En cada paso, la red escupe un vector con estos valores:
+- Probabilidad: "¿Qué tan probable es usar esta nube?
+- Medias: "¿Dónde está el centro de la nube?
+- Desviaciones: "¿Qué tan ancha o alta es la nube?
+- Correlación: "¿La nube está inclinada?"
+- Fin de trazo: Probabilidad de levantar el lápiz.
+
+Resultados esperados:
+Archivo con los pesos del modelo entrenado
+
+6. Generación:
+Le daremos a la IA cualquier frase. Ella, en lugar de buscar fotos, empezará a "dibujar" punto por punto en un lienzo digital, uniendo las letras con la fluidez de mi propia mano.
+
+Funcionamiento:
+-Input Inicial: Se le da la frase ("hola") y un punto semilla (usualmente (0,0,0)).
+- El Bucle (Loop): La red recibe el punto anterior y calcula la atención, "¿Sigo en la 'h' o ya me muevo a la 'o'?", mientras que la MDN genera las distribuciones de probabilidad.
+- El Factor de Sesgo (Bias): Este es el control de creatividad, donde se decide qué tan "imaginativa" es la red. Un Bias alto significa que se elige siempre la ruta más probable, la letra sale perfecta, muy limpia; mientras que un Bias bajo significa que la red se permite explorar las "nubes" periféricas, por lo que la letra sale más temblorosa, más orgánica, con más variaciones.
+- Muestreo (Sampling): Se elige un punto aleatorio dentro de la distribución elegida y ese se convierte en el "punto anterior" para la siguiente vuelta del bucle. 
+- Renderizado: Se toma la lista final de coordenadas y se dibuja con matplotlib o se genera un SVG.
