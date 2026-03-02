@@ -142,7 +142,7 @@ def guardar_imagen(
 
 def main():
     parser = argparse.ArgumentParser(description="Generador de escritura a mano")
-    parser.add_argument('--checkpoint', type=str,   default='./modelos/handwriting_model.pt') # El mejor modelo hasta el momento es ./modelos/p_control.pt
+    parser.add_argument('--checkpoint', type=str,   default='./modelos/handwriting_model.pt') # No ejecutar hasta tener un modelo entrenado
     parser.add_argument('--texto',      type=str,   default='hola')
     parser.add_argument('--bias',       type=float, default=1.0,
                         help='Temperatura de muestreo. Mayor = más limpio. Rango sugerido: 0.5–3.0')
