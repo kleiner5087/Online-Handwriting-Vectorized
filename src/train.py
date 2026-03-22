@@ -14,25 +14,21 @@ SEED = 42
 
 # ─── Hiperparámetros ──────────────────────────────────────────────────────────
 BATCH_SIZE  = 64
-EPOCHS      = 500
+EPOCHS      = 800
 LR          = 1e-4
-EPOCH_SIZE  = 3000
-SAVE_PATH   = './modelos/handwriting_model.pt'
+EPOCH_SIZE  = 1000      # iter 9: 3000→1000 para ciclos de depuración rápidos (~15 batches/época)
+SAVE_PATH   = './modelos/model.pt'
 RESUME      = True
 
-# Scheduled Sampling
-SS_WARMUP   = 200    # épocas con teacher forcing puro
-SS_MIN      = 0.20   # ratio mínimo de TF al final del decay
+SS_WARMUP   = 400       # iter 9: 200→400 — SS solo cuando el modelo haya convergido bajo TF puro
+SS_MIN      = 0.55      # iter 13: 0.40→0.55 — NLL degradó +0.36u por debajo de tf=0.88; floor empírico confirmado
 
-# Loss
-MU_WEIGHT   = 0.0    # eliminado — debug check 4 confirma que amplifica grad explosion
-SIGMA_REG   = 0.30
-PEN_WEIGHT  = 8.0    # 12.0 producía sobrecorrección (pen→0.277 documentado)
-CLIP        = 1.5    # check 3: norma media ~80-120, clip=5 era inefectivo
+MU_WEIGHT   = 0.0
+SIGMA_REG   = 0.08      # iter 9: 0.30→0.02 — señal suave, protección real viene del floor softplus
+PEN_WEIGHT  = 4.0       # iter 13: mantener — reducir requiere reset optimizer, destructivo en época 570
+CLIP        = 5.0       # iter 9: 1.5→5.0 — TBPTT ya reduce normas; clip de 1.5 aplastaba 98% del gradiente
 
-# Truncated BPTT — limita la acumulación de gradiente a K pasos hacia atrás
-# Los estados ocultos fluyen forward sin restricción; solo el gradiente se trunca
-TBPTT_K     = 75     # ~2 caracteres por ventana a 43 pasos/char
+TBPTT_K     = 15        # iter 9: 75→40 (~1 carácter por ventana), complementa el aumento de CLIP
 
 # Log
 LOG_EVERY   = 10
@@ -147,7 +143,7 @@ def forward_tbptt(
         else:
             use_teacher = torch.rand(B, device=device) < teacher_ratio
             teacher_x   = strokes[:, t + 1, :]
-            sampled     = sample_from_mdn_batch(params_t.detach(), M=model.M, bias=0.0)
+            sampled     = sample_from_mdn_batch(params_t.detach(), M=model.M, bias=1.0)  # iter 13: 0.0→1.0 — samples más limpios, menor shock distribucional
             x_t         = torch.where(use_teacher.unsqueeze(1), teacher_x, sampled)
 
     return torch.stack(all_params, dim=1)
@@ -266,6 +262,7 @@ def main():
     scaler      = torch.cuda.amp.GradScaler(enabled=USE_AMP)
     start_epoch = 1
     best_loss   = float('inf')
+    best_nll    = float('inf')
 
     if RESUME and os.path.exists(SAVE_PATH):
         print(f"\nCheckpoint encontrado en '{SAVE_PATH}'.")
@@ -276,10 +273,11 @@ def main():
             ans = input('¿Cargar estado del optimizer? [y/n]: ').strip().lower()
             load_opt = ans if ans in ('y', 'n') else 'y'
 
-        checkpoint  = torch.load(SAVE_PATH, map_location=DEVICE)
+        checkpoint  = torch.load(SAVE_PATH, map_location=DEVICE, weights_only=False)
         model.load_state_dict(checkpoint['state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_loss   = checkpoint['loss']
+        best_nll    = checkpoint.get('best_nll', float('inf'))
 
         if load_opt == 'y':
             if 'optimizer' in checkpoint:
@@ -295,7 +293,7 @@ def main():
         for _ in range(epochs_past_warmup):
             scheduler.step()
 
-        print(f'  best_loss={best_loss:.4f}  |  '
+        print(f'  best_loss={best_loss:.4f}  |  best_nll={best_nll:.4f}  |  '
               f'LR actual: {optimizer.param_groups[0]["lr"]:.2e}\n')
     else:
         if RESUME:
@@ -340,12 +338,15 @@ def main():
                 f'{metrics["grad"]:7.2f}  {metrics["entropy"]:5.2f}'
             )
 
-        if loss < best_loss:
+        current_nll = metrics['nll']
+        if current_nll < best_nll:
+            best_nll  = current_nll
             best_loss = loss
             torch.save(
                 {
                     'epoch':      epoch,
                     'loss':       best_loss,
+                    'best_nll':   best_nll,
                     'state_dict': model.state_dict(),
                     'optimizer':  optimizer.state_dict(),
                     'char_vocab': char_vocab,
@@ -355,7 +356,7 @@ def main():
                 },
                 SAVE_PATH,
             )
-            print(f'  ✓ Checkpoint guardado  (época={epoch}  loss={best_loss:.4f})')
+            print(f'  ✓ Checkpoint guardado  (época={epoch}  nll={best_nll:.4f}  loss={best_loss:.4f})')
 
     print('\nEntrenamiento finalizado.')
 

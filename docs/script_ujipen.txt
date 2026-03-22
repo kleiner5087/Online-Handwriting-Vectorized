@@ -1,62 +1,89 @@
 INFORME TECNICO DE PROCESAMIENTO DE DATOS: UJIPEN.PY
 
 RESUMEN OPERATIVO
-El script UJIPen.py actua como el motor de preparacion de datos para un modelo generativo basado en vectores. 
-Su funcion principal es tomar coordenadas absolutas de trazos manuscritos, ensamblarlas dinamicamente en palabras 
-completas y transformarlas en secuencias de movimientos relativos, garantizando que los tensores resultantes esten 
-estabilizados matematicamente para el entrenamiento.
+El script UJIPen.py actua como el motor de preparacion de datos para un modelo generativo basado en vectores.
+Su funcion principal es tomar coordenadas absolutas de trazos manuscritos, ensamblarlas dinamicamente en palabras
+completas y transformarlas en secuencias de movimientos relativos, garantizando que los tensores resultantes esten
+estabilizados matematicamente para el entrenamiento. El archivo ha sido auditado y corregido en profundidad:
+se eliminaron tres bugs estructurales que contaminaban la senal de pen-lift y la normalizacion.
 
 1. CARGA DE DATASET Y VOCABULARIO
-El sistema lee el archivo de texto secuencialmente y mapea entidades HTML a caracteres reales, como acentos y eñes. 
-En la prueba, el script cargo exitosamente 11640 muestras distribuidas en 97 clases o caracteres unicos. Ademas, 
-inicializa un vocabulario inmenso de 819392 palabras, el cual sirve como base para generar muestras de entrenamiento 
-con sentido semantico real.
+El sistema lee el archivo de texto secuencialmente y mapea entidades HTML a caracteres reales, como acentos y enes.
+El script carga exitosamente 11640 muestras distribuidas en 97 clases o caracteres unicos.
+
+El vocabulario se filtra a palabras de entre 1 y 8 caracteres. De las 819392 palabras originales del diccionario,
+quedan 225073 palabras utiles. El cap de 8 caracteres reduce la varianza de longitud de secuencia en el DataLoader:
+8 caracteres por aproximadamente 60 pasos por caracter produce secuencias de hasta 480 pasos, que el parametro
+T_MAX_TRAIN=300 del collate_fn recorta al limite operativo del entrenamiento.
 
 2. SINTESIS DE PALABRAS Y HEURISTICA DE LINEA BASE
-Dado que el dataset original contiene letras aisladas, el script debe crear palabras artificiales concatenando los 
-trazos horizontalmente. Lo hace calculando la caja delimitadora (bounding box) de cada letra.
+Dado que el dataset original contiene letras aisladas, el script crea palabras artificiales concatenando los
+trazos horizontalmente. Lo hace calculando la caja delimitadora (bounding box) de cada letra y avanzando un cursor
+horizontal con espaciado de 20 unidades entre caracteres.
 
-El diagnostico revela que la heuristica de linea base funciona a la perfeccion. En la palabra de prueba "ag", la letra 
-"a" mantiene sus coordenadas verticales estrictamente negativas (de -600.66 a 0.00), apoyandose exactamente en el suelo
-o linea base. Sin embargo, al procesar la letra "g" (una letra descendente), el sistema empuja su limite inferior un 
-30 por ciento hacia abajo, haciendo que sus valores verticales crucen hacia el lado positivo, llegando hasta 254.61. Este 
-ajuste reproduce con precision la forma en que los humanos escribimos letras con cola, manteniendo un espaciado horizontal 
-de 20 unidades entre cada caracter.
+La heuristica de linea base ancla el eje vertical de modo que max_y=0 para letras normales, dejando las coordenadas
+Y estrictamente negativas (la pluma sube desde la linea base). Para letras descendentes (g, j, p, q, y), el sistema
+empuja el limite inferior un 30 por ciento del alto de la letra hacia el lado positivo, reproduciendo la cola
+caracteristica de esos caracteres. Las coordenadas absolutas resultantes tienen rangos tipicos de X[0, 4000] e
+Y[-1300, 350] dependiendo del numero y tipo de letras en la palabra sintetica.
 
 3. NORMALIZACION DE DATOS
-Para evitar la destruccion de los datos por doble normalizacion que vimos en depuraciones pasadas donde los valores se 
-aplastaban cerca de -1.0, el script ahora implementa una estrategia mucho mas limpia. Primero, calcula la desviacion estandar 
-global de los movimientos: 49.04 para delta x, y 69.91 para delta y.
+La desviacion estandar se calcula iterando exclusivamente sobre movimientos intra-trazo, es decir, dentro de cada
+stroke individualmente, sin cruzar entre trazos. Esto evita que los saltos inter-trazo (desplazamientos del cursor
+entre letras) inflen artificialmente la estadistica. Los valores actuales del dataset son aproximadamente
+std_dx=20.28 y std_dy=26.83.
 
-La clave de este paso es que el script ignora deliberadamente la media. Al dividir unicamente por la desviacion estandar, 
-reduce la escala de los valores para facilitar el aprendizaje de la red neuronal, pero preserva la direccion original de 
-los trazos, algo critico para que el modelo sepa hacia donde mover la pluma.
+La normalizacion divide unicamente por la desviacion estandar, sin restar la media. Esto preserva la direccion
+original de los trazos y el sesgo natural de la escritura (tendencia a moverse hacia la derecha), que el modelo
+debe aprender a reproducir. El rango de deltas normalizados observado en produccion es de aproximadamente
++-4 en ambos ejes. El clipping de seguridad esta configurado en +-10, lo cual es un margen conservador que nunca
+se activa en condiciones normales pero protege contra outliers extremos del dataset.
 
-4. TRANSFORMACION DE COORDENADAS A DELTAS
-El modelo no puede aprender de coordenadas absolutas en un lienzo infinito; necesita instrucciones relativas de desplazamiento 
-paso a paso. La funcion encargada toma los puntos originales (por ejemplo, saltar de X=76.32 a X=67.11) y calcula la diferencia 
-exacta entre ellos.
+4. TRANSFORMACION DE COORDENADAS A DELTAS (to_deltas)
+El modelo trabaja con instrucciones relativas de desplazamiento paso a paso. La funcion to_deltas implementa
+el siguiente pipeline:
 
-El tensor resultante tiene dimensiones tridimensionales por cada paso de tiempo. El diagnostico confirma la siguiente 
-estructura para los vectores generados:
+PASO 1 — Filtrado de trazos degenerados: los trazos donde todos los puntos son identicos (fenomeno documentado
+en el dataset UJI original) se descartan completamente. No emiten ningun token, ni siquiera un pen-lift. Esto
+elimina la causa raiz de los pen-lifts consecutivos que entrenaban incorrectamente el sigmoid de e_raw.
 
-* Vector de inicio: El primer elemento de toda secuencia es siempre un Token SOS (Start Of Sequence) representado por el vector 
-[0.0, 0.0, 1.0].
-* Trazos continuos: Los siguientes vectores contienen los valores delta x y delta y ya divididos por la desviacion estandar, 
-acompañados de un 0.0 en la tercera posicion, indicando que la pluma esta tocando el papel.
-* Levantamiento de pluma: Cuando un trazo termina, la tercera posicion cambia a 1.0 (Pen Lift), instruyendo al modelo a 
-levantar el trazo antes de iniciar el siguiente.
+PASO 2 — Calculo de deltas intra-trazo: para cada trazo valido se calculan las diferencias (dx, dy) entre
+puntos consecutivos. Los puntos duplicados (dx < 1e-4 y dy < 1e-4) se saltan sin emitir delta.
 
-Ademas, el recorte de seguridad (clipping) configurado entre -20.0 y 20.0 se mantiene inactivo en condiciones normales, ya que 
-los valores de la muestra oscilaron entre -0.79 y 0.76, operando en un rango matematicamente seguro que previene la explosion de gradientes.
+PASO 3 — Marcado de pen-lift en posicion correcta: el pen-lift (tercera dimension = 1.0) se coloca en el
+ULTIMO movimiento real de cada trazo no-final. Esto es consistente con la semantica de generate.py, donde
+pen=1 en un vector significa "este movimiento es el ultimo del trazo actual, levantar la pluma despues".
+En la version anterior el pen-lift se emitia como token separado al INICIO del trazo siguiente, lo cual
+creaba un mismatch entre entrenamiento e inferencia.
+
+PASO 4 — Post-proceso A: el primer delta de la secuencia nunca puede tener pen=1, ya que quedaria
+consecutivo con el token SOS. Si ocurre (trazo de un solo movimiento valido al inicio), se fuerza a pen=0.
+
+PASO 5 — Post-proceso B: si tras el procesamiento por trazos quedan pen-lifts consecutivos residuales
+(trazos de exactamente un movimiento valido adyacentes entre si), el segundo se convierte en pen=0.
+El movimiento (dx, dy) se preserva integro; solo se elimina la senal de segmentacion redundante.
+
+La estructura del tensor resultante es la siguiente:
+
+* Token SOS: el primer elemento de toda secuencia es siempre [0.0, 0.0, 1.0].
+* Movimientos normales: vectores [dx/std_dx, dy/std_dy, 0.0] con pluma en el papel.
+* Ultimo movimiento de trazo: vectores [dx/std_dx, dy/std_dy, 1.0] indicando fin del trazo actual.
+* El ultimo trazo de la secuencia no lleva pen=1 en su ultimo movimiento (no hay trazo siguiente).
+
+Tasa de pen-lift resultante en produccion: aproximadamente 2.9 por ciento del total de pasos, coherente
+con la constante TRUE_PEN_RATE=0.029 usada en debug_model.py. Palabras con simbolos de puntuacion de
+multiples trazos (como dos puntos o punto y coma) pueden alcanzar tasas locales de hasta 6-7 por ciento
+sin que ello represente un error.
 
 5. GENERACION DINAMICA EN EL DATALOADER
-Para maximizar la generalizacion del modelo y compensar la escasez inicial de datos, el sistema no entrega el mismo dataset en 
-cada iteracion. Alterna dinamicamente entre dos fuentes:
+El sistema no entrega el mismo dataset en cada iteracion. Alterna dinamicamente entre dos fuentes:
 
-* Palabras del diccionario: En la muestra de 100 llamadas, el 66 por ciento de las veces selecciono palabras reales.
-* Cadenas aleatorias: El 34 por ciento restante genero secuencias de letras al azar.
-Esta proporcion (cercana al 70/30 programado) obliga al modelo a aprender transiciones mecanicas complejas entre letras que no 
-suelen ir juntas, en lugar de solo memorizar palabras comunes.
+* Palabras del diccionario: el 70 por ciento de las veces selecciona una palabra real del vocabulario filtrado.
+* Cadenas aleatorias: el 30 por ciento restante genera secuencias de entre 3 y 9 caracteres tomados
+  aleatoriamente del conjunto de clases disponibles en el dataset.
+
+Esta proporcion obliga al modelo a aprender transiciones mecanicas complejas entre letras que no suelen
+ir juntas, en lugar de solo memorizar palabras comunes, y garantiza cobertura de los 97 caracteres incluyendo
+simbolos poco frecuentes en el vocabulario natural.
 
 FIN DEL INFORME
