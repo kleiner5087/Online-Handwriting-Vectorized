@@ -11,8 +11,7 @@ import torch
 sys.path.insert(0, '.')
 from src.model import HandwritingGenerator, sample_from_mdn
 
-TRUE_PEN_RATE = 0.0296
-
+TRUE_PEN_RATE = 0.0535
 
 def parse_range(raw: str) -> list[float]:
     try:
@@ -27,7 +26,6 @@ def parse_range(raw: str) -> list[float]:
         vals.append(round(v, 6))
         v += step
     return vals
-
 
 def load_checkpoint(ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -44,7 +42,6 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
         'best_nll':   float(ckpt.get('best_nll', float('nan'))),
     }
     return model, stats
-
 
 @torch.no_grad()
 def generate_one(
@@ -92,16 +89,13 @@ def generate_one(
         o2, h2 = model.lstm2(inp2, h2)
         o2     = model.norm2(o2.squeeze(1))
 
-        features   = torch.cat([o1, o2], dim=1)
+        features   = torch.cat([o1, o2, window], dim=1)
         raw_params = torch.cat([model.mdn_head(features), model.pen_head(features)], dim=-1).squeeze(0)
         params_out.append(raw_params.cpu().numpy())
 
         sample_params        = raw_params.clone()
         sample_params[-1]   -= pen_bias
         x_t = sample_from_mdn(sample_params, M=model.M, bias=bias).unsqueeze(0)
-
-        if x_t[0, 2].item() > 0.5:
-            x_t = torch.tensor([[0.0, 0.0, 1.0]], device=device)
 
         strokes_out.append(x_t.squeeze(0).cpu().numpy())
 
@@ -110,13 +104,14 @@ def generate_one(
     params_arr = np.array(params_out,     dtype=np.float32) if params_out     else np.zeros((0, 1), dtype=np.float32)
     return strokes, attentions, params_arr, stop_reason
 
-
 def compute_sample_metrics(
     strokes:    np.ndarray,
     attentions: np.ndarray,
     params_arr: np.ndarray,
     std_dx:     float,
     std_dy:     float,
+    mean_dx:    float,
+    mean_dy:    float,
     stop_reason: str,
     M:          int,
 ) -> dict:
@@ -125,8 +120,10 @@ def compute_sample_metrics(
     dy  = strokes[1:, 1]
     pen = strokes[1:, 2]
 
-    abs_x = np.cumsum(dx * std_dx)
-    abs_y = np.cumsum(dy * std_dy)
+    abs_dx = dx * std_dx + mean_dx
+    abs_dy = dy * std_dy + mean_dy
+    abs_x = np.cumsum(abs_dx)
+    abs_y = np.cumsum(abs_dy)
 
     pen_idx  = np.where(pen > 0.5)[0]
     norm_idx = np.where(pen <= 0.5)[0]
@@ -206,7 +203,6 @@ def compute_sample_metrics(
         'smin':            smin,
     }
 
-
 SCALAR_KEYS = [
     'n_pasos', 'drift_y_total', 'drift_y_max', 'drift_x_total',
     'dy_norm_mean', 'dx_norm_mean',
@@ -219,7 +215,6 @@ SCALAR_KEYS = [
 MEAN_STD_KEYS = {
     'pen_rate_x_true', 'drift_y_total', 'dy_norm_mean', 'sep', 'naz',
 }
-
 
 def aggregate(sample_metrics: list[dict]) -> dict:
     n   = len(sample_metrics)
@@ -241,7 +236,6 @@ def aggregate(sample_metrics: list[dict]) -> dict:
     agg['stop_max_pct']    = stop_counts.get('max_steps', 0) / n
     return agg
 
-
 CSV_COLUMNS = [
     'bias', 'pen_bias',
     'pen_rate_x_true_mean', 'pen_rate_x_true_std',
@@ -258,7 +252,6 @@ CSV_COLUMNS = [
     'stop_phi_pct', 'stop_length_pct', 'stop_max_pct',
 ]
 
-
 def fmt(v) -> str:
     if isinstance(v, str):
         return v
@@ -267,7 +260,6 @@ def fmt(v) -> str:
     if isinstance(v, int):
         return str(v)
     return f'{v:.5f}'
-
 
 def run_sweep(args, model: HandwritingGenerator, stats: dict, device: torch.device):
     bias_vals     = parse_range(args.bias_range)
@@ -307,6 +299,7 @@ def run_sweep(args, model: HandwritingGenerator, stats: dict, device: torch.devi
                 m = compute_sample_metrics(
                     strokes, attentions, params_arr,
                     stats['std_dx'], stats['std_dy'],
+                    stats['mean_dx'], stats['mean_dy'],
                     stop_reason, model.M,
                 )
                 sample_metrics.append(m)
@@ -340,20 +333,17 @@ def run_sweep(args, model: HandwritingGenerator, stats: dict, device: torch.devi
     print(f"\n→ {out_path}")
     print(f"  {total} filas × {len(CSV_COLUMNS)} columnas")
 
-
 def main():
     parser = argparse.ArgumentParser(
         description='Sweep bias × pen_bias para diagnóstico de inferencia'
     )
-    parser.add_argument('--checkpoint',     type=str,   default='./modelos/model4.pt')
-    parser.add_argument('--texto',          type=str,   default='hola')
+    parser.add_argument('--checkpoint',     type=str,   default='./modelos/model8.pt')
+    parser.add_argument('--texto',          type=str,   default='desierto')
     parser.add_argument('--nsamples',       type=int,   default=10)
-    parser.add_argument('--bias_range',     type=str,   default='2.0,4.0,0.5',
-                        help='start,stop,step  (ej: 2.0,4.0,0.5)')
-    parser.add_argument('--pen_bias_range', type=str,   default='-3.0,3.0,0.5',
-                        help='start,stop,step  (ej: -3.0,3.0,0.5)')
+    parser.add_argument('--bias_range',     type=str,   default='2.0,4.0,0.5')
+    parser.add_argument('--pen_bias_range', type=str,   default='-3.0,3.0,0.5')
     parser.add_argument('--max_steps',      type=int,   default=2000)
-    parser.add_argument('--steps_per_char', type=int,   default=80)
+    parser.add_argument('--steps_per_char', type=int,   default=120)
     parser.add_argument('--device',         type=str,   default='auto')
     parser.add_argument('--out_dir',        type=str,   default='./audit_results')
     parser.add_argument('--seed',           type=int,   default=42)
@@ -367,7 +357,6 @@ def main():
 
     model, stats = load_checkpoint(args.checkpoint, device)
     run_sweep(args, model, stats, device)
-
 
 if __name__ == '__main__':
     main()

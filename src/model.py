@@ -4,13 +4,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-STROKE_DIM   = 3
-HIDDEN_SIZE  = 512
-EMBED_DIM    = 64
-K_ATTN       = 10
-M_MDN        = 10
-SIGMA_REG_W  = 0.30
-DELTA_MAX    = 0.05
+STROKE_DIM  = 3
+HIDDEN_SIZE = 512
+EMBED_DIM   = 64
+K_ATTN      = 10
+M_MDN       = 10
+DELTA_MAX   = 0.05
 
 
 class SoftAttentionWindow(nn.Module):
@@ -74,10 +73,6 @@ class HandwritingGenerator(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_size)
         self.norm2 = nn.LayerNorm(hidden_size)
 
-        # mdn_head y pen_head reciben también la ventana de atención (window)
-        # para que los parámetros gaussianos sean función directa del carácter
-        # actual, no solo del estado recurrente histórico.
-        # dim: hidden_size*2 (o1+o2) + embed_dim (window) = 1024+64 = 1088
         self.mdn_head = nn.Linear(hidden_size * 2 + embed_dim, M * 6)
         self.pen_head = nn.Sequential(
             nn.Linear(hidden_size * 2 + embed_dim, 128),
@@ -93,10 +88,6 @@ class HandwritingGenerator(nn.Module):
         nn.init.zeros_(self.pen_head[0].bias)
         nn.init.xavier_uniform_(self.pen_head[2].weight)
         with torch.no_grad():
-            # Bias inicial negativo: el modelo arranca conservador en pen-lift.
-            # Con la nueva entrada (1088-dim) xavier_uniform es correcto para
-            # mdn_head; pen_head[2] necesita el sesgo negativo explícito igual
-            # que antes para no disparar pen-lifts al inicio del entrenamiento.
             self.pen_head[2].bias.data.fill_(-3.0)
 
     def _zero_hidden(self, batch: int, device: torch.device):
@@ -144,57 +135,6 @@ class HandwritingGenerator(nn.Module):
         pen_logits = self.pen_head(output)
         return torch.cat([mdn_params, pen_logits], dim=-1)
 
-    @torch.no_grad()
-    def generate(
-        self,
-        text:       str,
-        max_steps:  int   = 1000,
-        bias:       float = 1.0,
-        device:     torch.device | None = None,
-    ) -> list[np.ndarray]:
-        if device is None:
-            device = next(self.parameters()).device
-
-        self.eval()
-        char_embeds = self.char_embed(self.encode_text([text], device))
-        U           = char_embeds.shape[1]
-
-        self.attention.reset(1, device)
-        h1     = self._zero_hidden(1, device)
-        h2     = self._zero_hidden(1, device)
-        window = torch.zeros(1, self.embed_dim, device=device)
-        x_t    = torch.tensor([[0.0, 0.0, 1.0]], device=device)
-
-        strokes = [x_t.squeeze(0).cpu().numpy()]
-
-        for step in range(max_steps):
-            inp1        = torch.cat([x_t, window], dim=1).unsqueeze(1)
-            o1, h1      = self.lstm1(inp1, h1)
-            o1          = self.norm1(o1.squeeze(1))
-            window, phi = self.attention(o1, char_embeds)
-
-            phi_vals   = phi.squeeze(0)
-            phi_norm   = phi_vals / (phi_vals.sum() + 1e-8)
-            last_ratio = phi_norm[-1].item()
-            cond_phi   = last_ratio > phi_norm[:-1].max().item() and last_ratio > 0.6
-            cond_len   = step > U * 80
-            if cond_phi or cond_len:
-                break
-
-            inp2   = torch.cat([x_t, window, o1], dim=1).unsqueeze(1)
-            o2, h2 = self.lstm2(inp2, h2)
-            o2     = self.norm2(o2.squeeze(1))
-
-            features = torch.cat([o1, o2, window], dim=1)
-            params   = torch.cat([
-                self.mdn_head(features),
-                self.pen_head(features),
-            ], dim=-1).squeeze(0)
-            x_t = sample_from_mdn(params, M=self.M, bias=bias).unsqueeze(0)
-            strokes.append(x_t.squeeze(0).cpu().numpy())
-
-        return strokes
-
 
 def parse_mdn_params(params: torch.Tensor, M: int = M_MDN, bias: float = 0.0):
     pi_raw  = params[..., :M]
@@ -206,8 +146,8 @@ def parse_mdn_params(params: torch.Tensor, M: int = M_MDN, bias: float = 0.0):
     e_raw   = params[..., -1]
 
     pi      = F.softmax(pi_raw * (1.0 + bias), dim=-1)
-    sigma_x = F.softplus(s_x_raw - bias) + 0.10
-    sigma_y = F.softplus(s_y_raw - bias) + 0.10
+    sigma_x = F.softplus(s_x_raw - bias) + 0.05
+    sigma_y = F.softplus(s_y_raw - bias) + 0.05
     rho     = torch.tanh(rho_raw)
     e       = torch.sigmoid(e_raw)
     return pi, mu_x, mu_y, sigma_x, sigma_y, rho, e
@@ -222,39 +162,23 @@ def _bivariate_log_prob(
     sigma_y: torch.Tensor,
     rho:     torch.Tensor,
 ) -> torch.Tensor:
-    rho     = torch.clamp(rho, -0.99, 0.99)
-    eps     = 1e-6
-    norm_x  = (dx - mu_x) / (sigma_x + eps)
-    norm_y  = (dy - mu_y) / (sigma_y + eps)
-    rho2    = 1.0 - rho ** 2
-    Z       = norm_x ** 2 + norm_y ** 2 - 2.0 * rho * norm_x * norm_y
+    rho    = torch.clamp(rho, -0.99, 0.99)
+    eps    = 1e-6
+    norm_x = (dx - mu_x) / (sigma_x + eps)
+    norm_y = (dy - mu_y) / (sigma_y + eps)
+    rho2   = 1.0 - rho ** 2
+    Z      = norm_x ** 2 + norm_y ** 2 - 2.0 * rho * norm_x * norm_y
     log_det = torch.log(2.0 * math.pi * sigma_x * sigma_y * rho2.sqrt() + eps)
     return -Z / (2.0 * rho2) - log_det
 
 
-def _make_soft_target(pen_hard: torch.Tensor, pen_sigma: float) -> torch.Tensor:
-    r      = int(pen_sigma * 3)
-    ks     = 2 * r + 1
-    t_vals = torch.arange(-r, r + 1, device=pen_hard.device, dtype=pen_hard.dtype)
-    kernel = torch.exp(-0.5 * (t_vals / pen_sigma) ** 2)
-    kernel = (kernel / kernel.sum()).view(1, 1, ks)
-    return F.conv1d(pen_hard.unsqueeze(1), kernel, padding=r).squeeze(1).clamp(0.0, 1.0)
-
-
 def mdn_loss(
-    mdn_params:    torch.Tensor,
-    targets:       torch.Tensor,
-    mask:          torch.Tensor,
-    M:             int   = M_MDN,
-    sigma_reg:     float = SIGMA_REG_W,
-    mu_weight:     float = 0.0,
-    pen_weight:    float = 6.0,
-    pen_sigma:     float = 0.0,
-    freq_weight:   float = 0.0,
-    true_pen_rate: float = 0.0296,
-    anchor_weight: float = 0.0,
-    anchor_target: float = -3.5,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    mdn_params: torch.Tensor,
+    targets:    torch.Tensor,
+    mask:       torch.Tensor,
+    M:          int   = M_MDN,
+    pen_weight: float = 1.5,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     pi, mu_x, mu_y, sigma_x, sigma_y, rho, _ = parse_mdn_params(mdn_params, M)
 
     dx       = targets[..., 0:1]
@@ -267,61 +191,20 @@ def mdn_loss(
     e_raw = mdn_params[..., -1]
     pen_w = torch.tensor(pen_weight, device=e_raw.device)
 
-    if pen_sigma > 0.0:
-        soft_target = _make_soft_target(pen_hard, pen_sigma)
-    else:
-        soft_target = pen_hard
-
     pen_loss = F.binary_cross_entropy_with_logits(
-        e_raw, soft_target, pos_weight=pen_w, reduction='none'
+        e_raw, pen_hard, pos_weight=pen_w, reduction='none'
     )
 
     stroke_mask     = mask > 0.5
     per_step_stroke = torch.where(stroke_mask, -log_mixture, torch.zeros_like(log_mixture))
     per_step_pen    = torch.where(mask > 0.5,  pen_loss,     torch.zeros_like(pen_loss))
+    
     nll_stroke      = per_step_stroke.sum() / (stroke_mask.sum().float() + 1e-8)
     nll_pen_bce     = per_step_pen.sum()    / (mask.sum().float()         + 1e-8)
-    nll_loss        = nll_stroke + nll_pen_bce
+    
+    nll_loss = nll_stroke + nll_pen_bce
 
-    wmu_x    = (pi * mu_x).sum(dim=-1)
-    wmu_y    = (pi * mu_y).sum(dim=-1)
-    mse_mask = mask > 0.5
-    mse_loss = (
-        (wmu_x - targets[..., 0]).pow(2) +
-        (wmu_y - targets[..., 1]).pow(2)
-    )
-    mse_loss = mse_loss[mse_mask].mean() * mu_weight
-
-    s_x_raw          = mdn_params[..., 3 * M : 4 * M]
-    s_y_raw          = mdn_params[..., 4 * M : 5 * M]
-    sigma_target_log = -0.5
-    reg = sigma_reg * (
-        (s_x_raw - sigma_target_log).pow(2) +
-        (s_y_raw - sigma_target_log).pow(2)
-    ).mean()
-
-    entropy_reg = -(pi * torch.log(pi + 1e-8)).sum(-1).mean()
-
-    # freq_floor: penaliza si la frecuencia media de pen-lift predicha cae por debajo
-    # de la tasa real del dataset. Solo actúa cuando el modelo es conservador (freq < true).
-    # Monitorear: sep no debe caer por debajo de 2.0 al activar este término.
-    freq_floor = torch.tensor(0.0, device=e_raw.device)
-    if freq_weight > 0.0:
-        valid_mask = mask > 0.5
-        if valid_mask.any():
-            freq_pred  = torch.sigmoid(e_raw[valid_mask]).mean()
-            freq_floor = freq_weight * F.relu(true_pen_rate - freq_pred) ** 2
-
-    anchor_loss = torch.tensor(0.0, device=e_raw.device)
-    if anchor_weight > 0.0:
-        norm_mask = (mask > 0.5) & (pen_hard < 0.5)
-        if norm_mask.any():
-            anchor_loss = anchor_weight * F.relu(
-                anchor_target - e_raw[norm_mask]
-            ).pow(2).mean()
-
-    total = nll_loss + reg + mse_loss + (-0.30 * entropy_reg) + freq_floor + anchor_loss
-    return total, nll_loss, nll_stroke, anchor_loss
+    return nll_loss, nll_loss, nll_stroke
 
 
 @torch.no_grad()
