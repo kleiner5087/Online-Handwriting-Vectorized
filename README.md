@@ -78,37 +78,37 @@ para el condicionamiento de texto y una capa de salida probabilística (MDN) aco
    El pipeline está diseñado para ejecutarse en entornos basados en Linux (vía WSL2 en Windows) para garantizar la correcta compilación y
    compatibilidad de las librerías de aceleración por hardware (CUDA).
 
-Nota: Instalar el driver de NVIDIA mas reciente para su gpu (Gameready o Studio)
+  Nota: Instalar el driver de NVIDIA mas reciente para su gpu (Gameready o Studio)
 
-1.1 Abrir CMD como administrador y descargar e instalar WSL2 con la última versión de Ubuntu. Configurar usuario y contraseña desde la terminal de WSL.
-// wsl --install
+    1.1 Abrir CMD como administrador y descargar e instalar WSL2 con la última versión de Ubuntu. Configurar usuario y contraseña desde la terminal de WSL.
+    // wsl --install
 
-1.2 Actualizar repositorios del sistema
-// sudo apt update && sudo apt upgrade -y
+    1.2 Actualizar repositorios del sistema
+    // sudo apt update && sudo apt upgrade -y
 
-1.3 Instalar dependencias de Python
-// sudo apt install python3.13 python3.13-venv python3-pip -y
+    1.3 Instalar dependencias de Python
+    // sudo apt install python3.13 python3.13-venv python3-pip -y
 
-1.4 Clonar el repositorio y acceder al directorio
-// git clone <https://github.com/kleiner5087/Online-Handwriting-Vectorized.git>
-// cd <NOMBRE_DEL_REPOSITORIO>
+    1.4 Clonar el repositorio y acceder al directorio
+    // git clone <https://github.com/kleiner5087/Online-Handwriting-Vectorized.git>
+    // cd <NOMBRE_DEL_REPOSITORIO>
 
-1.5 Crear y activar el entorno virtual
-// python3.13 -m venv venv
-// source venv/bin/activate
+    1.5 Crear y activar el entorno virtual
+    // python3.13 -m venv venv
+    // source venv/bin/activate
 
-1.6 Instalar requerimientos del proyecto
-// pip install -r requirements.txt
+    1.6 Instalar requerimientos del proyecto
+    // pip install -r requirements.txt
 
-1.7 Abrir VSC
-// code .
+    1.7 Abrir VSC
+    // code .
 
 2. Uso de entrenamiento (train.py)
-   Para iniciar la fase de entrenamiento base, ejecuta el script principal. Durante la ejecución, la consola monitorea las métricas
-   y se genera un archivo csv con las metricas de cada 25 epocas.
-   // python -m src.debug_model
+    Para iniciar la fase de entrenamiento base, ejecuta el script principal. Durante la ejecución, la consola monitorea las métricas
+    y se genera un archivo csv con las metricas de cada 25 epocas.
+    // python -m src.debug_model
 
-   Nota: Los pesos del modelo (checkpoints) se guardarán automáticamente en el directorio ./modelos/ a medida que la red mejore.
+    Nota: Los pesos del modelo (checkpoints) se guardarán automáticamente en el directorio ./modelos/ a medida que la red mejore.
 
 3. Uso de inferencia (generate.py)
    El script generate.py permite visualizar las secuencias espaciales generadas por la red. Dado que el modelo predice densidades
