@@ -33,6 +33,7 @@ El sistema implementa una red neuronal recurrente autorregresiva basada en la co
 para el condicionamiento de texto y una capa de salida probabilística (MDN) acoplada a un clasificador binario independiente para el control del lápiz.
 
 1. El Codificador (Soft Attention)
+
    La ventana de atención suave (SoftAttentionWindow) se encarga de guiar al modelo a lo largo de la secuencia de caracteres del texto
    de entrada, permitiéndole mapear qué letra corresponde dibujar en cada paso temporal.
 
@@ -44,6 +45,7 @@ para el condicionamiento de texto y una capa de salida probabilística (MDN) aco
   de los embeddings de los caracteres, impidiendo que el mecanismo de atención retroceda o salte de forma errática durante la generación de texto continuo.
 
 2. El Cerebro Secuencial (Capas LSTM)
+
    El núcleo del modelo procesa las trayectorias espaciales y mantiene el contexto secuencial mediante dos capas LSTM apiladas de 512
    unidades ocultas cada una, optimizadas con normalización de capa (LayerNorm).
 
@@ -58,6 +60,7 @@ para el condicionamiento de texto y una capa de salida probabilística (MDN) aco
   contexto a lo largo de la pila recurrente, estabilizando el flujo de gradientes.
 
 3. Las Cabezas de Salida (Split Heads)
+
    La arquitectura divide sus salidas en dos cabezales independientes que reciben la combinación de características de ambas capas recurrentes
    y el contexto de atención. Esta división previene la competencia destructiva de gradientes en la función de pérdida.
 
@@ -103,43 +106,42 @@ para el condicionamiento de texto y una capa de salida probabilística (MDN) aco
     1.7 Abrir VSC
     // code .
 
-2. Uso de entrenamiento (train.py)
+2. Uso de entrenamiento (train.py):
     Para iniciar la fase de entrenamiento base, ejecuta el script principal. Durante la ejecución, la consola monitorea las métricas
     y se genera un archivo csv con las metricas de cada 25 epocas.
     // python -m src.debug_model
 
     Nota: Los pesos del modelo (checkpoints) se guardarán automáticamente en el directorio ./modelos/ a medida que la red mejore.
 
-3. Uso de inferencia (generate.py)
+3. Uso de inferencia (generate.py):
    El script generate.py permite visualizar las secuencias espaciales generadas por la red. Dado que el modelo predice densidades
    de probabilidad y no puntos deterministas, es fundamental controlar el muestreo.
 
 - Parámetros Críticos:
 
-• --bias: Controla la varianza morfológica (los desplazamientos dx, dy). Un valor alto (ej. 3.0 o superior) reduce el tamaño de la
+  • --bias: Controla la varianza morfológica (los desplazamientos dx, dy). Un valor alto (ej. 3.0 o superior) reduce el tamaño de la
 distribución, forzando al modelo a elegir la trayectoria más probable y limpia, pero con riesgo de colapso modal. Un valor bajo
 (ej. 0.5) permite que la red explore distribuciones más amplias, introduciendo mayor aleatoriedad y variaciones orgánicas al trazo.
 
-• --pen_bias: Ajusta la sensibilidad de la cabeza lineal binaria. Interviene directamente en el umbral que decide cuándo el lápiz
+  • --pen_bias: Ajusta la sensibilidad de la cabeza lineal binaria. Interviene directamente en el umbral que decide cuándo el lápiz
 debe separarse del papel virtual.
 
 - Casos de uso para evaluación:
 
-• Validación morfológica + mapa de atención
-Evalúa el trazo generado y despliega el mapa de calor que muestra cómo el vector de gravedad del mecanismo Soft Attention avanza sobre los caracteres.
-// python -m src.generate --texto "escuela"
+  • Validación morfológica + mapa de atención
+    Evalúa el trazo generado y despliega el mapa de calor que muestra cómo el vector de gravedad del mecanismo Soft Attention avanza sobre los caracteres.      // python -m src.generate --texto "escuela"
 
-• Auditoría de varianza
-Genera múltiples iteraciones probabilísticas de la misma palabra para comprobar la estabilidad morfológica del modelo.
-// python -m src.generate --texto "hola" --mode grid --n 9
+  • Auditoría de varianza
+    Genera múltiples iteraciones probabilísticas de la misma palabra para comprobar la estabilidad morfológica del modelo.
+    // python -m src.generate --texto "hola" --mode grid --n 9
 
-• Comparar comportamiento entre palabras
-Renderiza varias palabras simultáneas en un solo pase.
-// python -m src.generate --mode compare --textos "hola" "mundo" "España" "python"
+  • Comparar comportamiento entre palabras
+    Renderiza varias palabras simultáneas en un solo pase.
+    // python -m src.generate --mode compare --textos "hola" "mundo" "España" "python"
 
-• SVG limpio para inspección vectorial
-Genera un archivo .svg estandarizado.
-python -m src.generate --texto "mundo" --svg
+  • SVG limpio para inspección vectorial
+    Genera un archivo .svg estandarizado.
+    // python -m src.generate --texto "mundo" --svg
 
 ---
 
