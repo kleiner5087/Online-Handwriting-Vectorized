@@ -1,16 +1,9 @@
 # Ignorar carpetas de datos
-debug/
-results/
 venv/
-audit_results/
 debug_logs/
 generaciones/
-modelos/
+debug_models/
 
 # Ignorar cachés de Python
 __pycache__/
 *.py[cod]
-
-# Ignorar archivos específicos en la raíz
-*.png
-*.pt

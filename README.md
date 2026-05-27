@@ -1,211 +1,155 @@
 # Generación de Escritura a Mano en Español — LSTM + MDN + Soft Attention
 
-Modelo generativo **online** (vectorial) de escritura manuscrita en español, entrenado sobre el dataset **UJI Pen Characters v2**. El sistema sintetiza palabras completas a partir de caracteres aislados y las genera como secuencias de deltas (dx, dy, pen\_lift) usando una LSTM con ventana de atención suave y una Mixture Density Network como cabeza de salida.
-
----
-
-## Estado Actual del Proyecto
-
-| Fase | Estado |
-|---|---|
-| Pipeline de datos (`UJIPen.py`) | ✅ Funcional y validado |
-| Arquitectura del modelo (`model.py`) | ✅ Implementada |
-| Sanity check (overfitting 2 muestras) | ✅ Superado en iteración 17 |
-| Entrenamiento principal (`train.py`) | 🔄 En progreso — estancado en época ~280 |
-| Generación / Inferencia (`generate.py`) | ⚠️ Operativa con limitaciones documentadas |
-
-**Mejor checkpoint guardado:** época 191, `loss = -2.5040`
+Modelo generativo online (vectorial) de escritura manuscrita en español, entrenado sobre el dataset UJI Pen Characters v2. El sistema
+sintetiza palabras completas a partir de caracteres aislados y las genera como secuencias de deltas (dx, dy, pen_lift) usando una LSTM
+con ventana de atención suave y una Mixture Density Network con Pen Head como salida.
 
 ---
 
 ## Dataset
 
-**UJI Pen Characters v2** — 11.640 muestras de caracteres manuscritos aislados, 97 clases únicas (letras ASCII + español, dígitos, símbolos). Recopilado en dos sitios (UJI y UPV), con diferente resolución de captura.
+El modelo se entrena sobre el UJI Pen Characters v2, un corpus público compuesto por 11,640 muestras de caracteres manuscritos aislados.
+El vocabulario abarca 97 clases únicas, incluyendo letras ASCII, caracteres del español (con acentos y diéresis), dígitos y símbolos
+ortográficos. Los datos originales contienen exclusivamente información espacial (coordenadas X/Y cartesianas), careciendo de métricas
+de presión o marcas de tiempo.
 
-- **Corrección de escala UPV:** coordenadas divididas por 1.52 (152 ink units/mm vs 100 en UJI).
-- **Solo coordenadas X/Y** — sin presión ni tiempo.
-- **40 escritores** para entrenamiento, **20** para test.
+Nota arquitectónica: El uso actual de este corpus representa la fase fundacional del entrenamiento. El objetivo a largo plazo contempla
+el fine-tuning con un dataset propio capturado en dispositivos de lápiz óptico (iPad) para asimilar las ligaduras continuas e intra-secuencia reales.
 
 ---
 
 ## Ingeniería de Datos (`UJIPen.py`)
 
-### Síntesis de palabras
-El dataset contiene únicamente letras aisladas. La clase `UJIDataset` las concatena horizontalmente para formar palabras sintéticas:
-
-- Calcula la bounding box de cada letra.
-- Aplica una **heurística de línea base**: las letras descendentes (`g, j, p, q, y`) empujan su límite inferior un 30% hacia abajo, reproduciendo el comportamiento real de la escritura.
-- Espaciado horizontal fijo de 20 unidades entre caracteres.
-
-### Normalización
-- **Solo se divide por la desviación estándar** — la media no se resta para preservar la direccionalidad de los trazos.
-- Estadísticas globales calculadas sobre 1.000 muestras sintéticas: `std_dx ≈ 49`, `std_dy ≈ 70`.
-- Clipping de seguridad en `[-20, 20]` (inactivo en condiciones normales; los valores oscilan entre -0.8 y 0.8).
-
-### Vectorización — formato Strokes-3
-Cada secuencia de trazos se convierte a deltas relativos:
-
-```
-[SOS]         → [0.0,  0.0,  1.0]   # Token de inicio
-[trazo]       → [dx/σ, dy/σ, 0.0]   # Pluma en papel
-[levantamiento] → [dx/σ, dy/σ, 1.0]  # Pen lift
-```
-
-### Generador híbrido
-El `DataLoader` alterna entre dos fuentes en cada epoch:
-
-- **70%** — palabras reales del diccionario (`words.txt`, 819.392 palabras con tildes y ñ).
-- **30%** — cadenas aleatorias de caracteres disponibles (robustez ante transiciones inusuales).
+El script UJIPen.py actua como el motor de preparacion de datos para un modelo generativo basado en vectores. Su funcion principal es
+tomar coordenadas absolutas de trazos manuscritos, ensamblarlas dinamicamente en palabras completas y transformarlas en secuencias de
+movimientos relativos, garantizando que los tensores resultantes esten estabilizados matematicamente para el entrenamiento. El flujo
+completo de procesamiento de datos se detalla en procesamiento_ujipen.txt
 
 ---
 
 ## Arquitectura del Modelo (`model.py`)
 
-```
-Entrada: secuencia de deltas (T × 3)
-  └─► LSTM-1 (512 unidades)
-       └─► Soft Attention Window  ──► contexto de letra actual (vector de embed_dim=64)
-  └─► LSTM-2 (512 unidades)  ←── skip connection: x_t + window + h1
-       └─► LayerNorm
-  └─► MDN Head  →  M=20 Gaussianas bivariadas + pen_lift
-```
+El sistema implementa una red neuronal recurrente autorregresiva basada en la combinación de capas LSTM, un mecanismo de atención suave
+para el condicionamiento de texto y una capa de salida probabilística (MDN) acoplada a un clasificador binario independiente para el control del lápiz.
 
-### A. Codificador de texto — Soft Attention Window
-Implementa la ventana de atención suave de Graves (2013). En cada paso `t`, calcula un vector de "gravedad" `φ(t)` sobre los caracteres del texto objetivo usando `K=10` componentes gaussianas. La atención se desplaza progresivamente de izquierda a derecha conforme la red dibuja.
+1. El Codificador (Soft Attention)
+   La ventana de atención suave (SoftAttentionWindow) se encarga de guiar al modelo a lo largo de la secuencia de caracteres del texto
+   de entrada, permitiéndole mapear qué letra corresponde dibujar en cada paso temporal.
 
-Parámetros de inicialización críticos: `bias[-K:] = -4.0` para forzar avance lento de `kappa` al inicio del entrenamiento.
+- Mecanismo de Ventana Dinámica: En lugar de utilizar una atención global basada en producto punto, este módulo proyecta el estado de
+  la primera capa LSTM mediante una capa lineal para calcular tres parámetros por cada componente de mezcla (K=10): la fuerza de la atención
+  (alpha), la precisión del enfoque (beta) y el avance del cursor espacial (delta).
+- Acumulación de Posición: El parámetro delta se mantiene estrictamente positivo y acotado por un límite máximo (DELTA_MAX = 0.05). Al
+  sumarse de manera acumulativa al parámetro kappa, la red garantiza matemáticamente un desplazamiento monótono hacia adelante a través
+  de los embeddings de los caracteres, impidiendo que el mecanismo de atención retroceda o salte de forma errática durante la generación de texto continuo.
 
-### B. LSTM de 2 capas apiladas
-- **LSTM-1:** recibe `(x_t, window)`. Alimenta la atención.
-- **LSTM-2:** recibe `(x_t, window, h1)` — skip connection directa desde la entrada.
-- **LayerNorm** después de cada capa (estabiliza el entrenamiento largo).
+2. El Cerebro Secuencial (Capas LSTM)
+   El núcleo del modelo procesa las trayectorias espaciales y mantiene el contexto secuencial mediante dos capas LSTM apiladas de 512
+   unidades ocultas cada una, optimizadas con normalización de capa (LayerNorm).
 
-### C. Mixture Density Network (MDN)
-La cabeza MDN predice los parámetros de una mezcla de **20 Gaussianas bivariadas** por cada paso de tiempo:
+- LSTM Capa 1: Recibe como entrada el punto anterior de la secuencia (un vector de dimensión 3 con coordenadas relativas dx, dy y el
+  estado del lápiz) concatenado con la ventana de contexto del paso anterior. Su salida alimenta directamente al mecanismo de atención.
+  Su aprendizaje se especializa en la alineación espacio-temporal. Analiza el trazo actual y decide cómo debe moverse la ventana de
+  atención sobre el texto. Básicamente aprende cuándo y cómo avanzar el cursor de lectura.
+- LSTM Capa 2 y Conexión Residual: Esta capa es el verdadero "dibujante" que recibe la salida de la primera capa (la inercia del movimiento
+  general), el contexto de la atención (qué letra específica toca dibujar) y la conexión residual (el punto exacto donde se encuentra). Su
+  aprendizaje se centra puramente en la morfología de la caligrafía.
+  Esta estructura actúa como una conexión de salto (skip connection) implícita que ayuda a preservar la información geométrica fina y el
+  contexto a lo largo de la pila recurrente, estabilizando el flujo de gradientes.
 
-- `π` — pesos de mezcla (softmax).
-- `(μx, μy)` — centros de cada Gaussiana.
-- `(σx, σy)` — desviaciones estándar; `clamp(min=0.10)` para evitar colapso.
-- `ρ` — correlación entre ejes; `tanh` para mantener en `(-1, 1)`.
-- `e` — probabilidad de pen lift (BCE con `pos_weight=12.0` para compensar desbalance ~8%).
+3. Las Cabezas de Salida (Split Heads)
+   La arquitectura divide sus salidas en dos cabezales independientes que reciben la combinación de características de ambas capas recurrentes
+   y el contexto de atención. Esta división previene la competencia destructiva de gradientes en la función de pérdida.
 
----
-
-## Función de Pérdida
-
-```
-L = NLL_mezcla + pen_BCE + MSE_medias_ponderadas + reg_sigma + (-0.05 · H(π))
-```
-
-- **NLL:** log-verosimilitud negativa de la mezcla gaussiana bivariada.
-- **pen\_BCE:** `pos_weight=12.0` para compensar la baja frecuencia de pen lifts.
-- **MSE medias:** penaliza que la media ponderada `Σ(π·μ)` se aleje del target real. `mu_weight=0.5` en producción.
-- **reg\_sigma:** empuja `log(σ)` hacia un valor objetivo (`-1.4 ≈ σ=0.24`). `sigma_reg=0.35`.
-- **Entropía de π:** penalización negativa `(-0.05 · H(π))` para evitar el colapso del MDN a un único componente.
-
----
-
-## Entrenamiento (`train.py`)
-
-### Hiperparámetros activos
-
-| Parámetro | Valor |
-|---|---|
-| `BATCH_SIZE` | 64 |
-| `EPOCHS` | 500 |
-| `LR` inicial | 1e-4 |
-| `EPOCH_SIZE` | 3.000 batches |
-| `CLIP` (grad norm) | 5.0 |
-| `SS_WARMUP` | 200 épocas |
-| `SS_MIN` | 0.20 |
-| `MU_WEIGHT` | 0.5 |
-| `SIGMA_REG` | 0.35 |
-
-### Scheduled Sampling
-- Épocas 1–200: teacher forcing puro (`tf=1.0`).
-- Épocas 200+: decay lineal hasta `tf=0.20`.
-- El muestreo durante SS se ejecuta **completamente en GPU** (`sample_from_mdn_batch`) — eliminó 1.49 millones de llamadas NumPy por época y redujo el tiempo de `~36 min → ~3-4 min/época`.
-
-### Hardware
-- NVIDIA RTX 3060 6GB VRAM, vía WSL + CUDA.
-- Uso de memoria GPU: ~2.9/6.0 GB con `BATCH_SIZE=64`.
+- Cabeza MDN (Mixture Density Network): Una capa lineal mapea las características hacia los parámetros de una mezcla de 10 gaussianas
+  bivariadas (M=10). Esta cabeza predice 60 valores en total correspondientes a los coeficientes de mezcla (pi), las medias espaciales
+  (mu_x, mu_y), las desviaciones estándar (sigma_x, sigma_y) y el factor de correlación (rho) de las nubes de probabilidad. Esto permite
+  que el modelo aprenda las variaciones y estilos naturales de la escritura en lugar de una trayectoria rígida promediada.
+- Cabeza Pen (Pen-Lift Head): Un bloque secuencial independiente compuesto por capas lineales y una activación ReLU procesa las mismas
+  características para emitir un único logit binario (e_raw). Este valor pasa por una función sigmoide para determinar la probabilidad de
+  levantar el lápiz del papel. Al aislar esta tarea de la cabeza MDN, el modelo logra optimizar la métrica de entropía cruzada binaria (BCE)
+  con mayor estabilidad, eliminando artefactos visuales de trazos fantasma ("rayoteo") entre caracteres.
 
 ---
 
-## Sistema de Monitoreo
+## Guia de uso
 
-El log de cada época reporta:
+1. Preparacion del entorno
+   El pipeline está diseñado para ejecutarse en entornos basados en Linux (vía WSL2 en Windows) para garantizar la correcta compilación y
+   compatibilidad de las librerías de aceleración por hardware (CUDA).
 
-```
-Época XXXX  loss=X.XXXX  nll=X.XXXX  lr=X.XXe-XX  tf=X.XX  |
-σx=X.XXX  σy=X.XXX  σmin=X.XXX  |  wμx=X.XXX  wμy=X.XXX  pen=X.XXX  |
-grad=XXX.XX  H(π)=X.XX
-```
+Nota: Instalar el driver de NVIDIA mas reciente para su gpu (Gameready o Studio)
 
-### Tabla de referencia de salud del modelo
+1.1 Abrir CMD como administrador y descargar e instalar WSL2 con la última versión de Ubuntu. Configurar usuario y contraseña desde la terminal de WSL.
+// wsl --install
 
-| Métrica | Sano | Alerta | Crítico |
-|---|---|---|---|
-| `σmin` | > 0.12 | 0.08–0.12 | < 0.08 |
-| `grad` | 0.5–3.0 | 3.0–4.5 | > 4.8 (clip siempre activo) |
-| `H(π)` | 1.5–2.5 | < 1.0 o > 2.8 | < 0.5 (colapso MDN) |
-| `pen` | ~0.08 | < 0.05 antes de época 200 | — |
+1.2 Actualizar repositorios del sistema
+// sudo apt update && sudo apt upgrade -y
+
+1.3 Instalar dependencias de Python
+// sudo apt install python3.13 python3.13-venv python3-pip -y
+
+1.4 Clonar el repositorio y acceder al directorio
+// git clone <https://github.com/kleiner5087/Online-Handwriting-Vectorized.git>
+// cd <NOMBRE_DEL_REPOSITORIO>
+
+1.5 Crear y activar el entorno virtual
+// python3.13 -m venv venv
+// source venv/bin/activate
+
+1.6 Instalar requerimientos del proyecto
+// pip install -r requirements.txt
+
+1.7 Abrir VSC
+// code .
+
+2. Uso de entrenamiento (train.py)
+   Para iniciar la fase de entrenamiento base, ejecuta el script principal. Durante la ejecución, la consola monitorea las métricas
+   y se genera un archivo csv con las metricas de cada 25 epocas.
+   // python -m src.debug_model
+
+   Nota: Los pesos del modelo (checkpoints) se guardarán automáticamente en el directorio ./modelos/ a medida que la red mejore.
+
+3. Uso de inferencia (generate.py)
+   El script generate.py permite visualizar las secuencias espaciales generadas por la red. Dado que el modelo predice densidades
+   de probabilidad y no puntos deterministas, es fundamental controlar el muestreo.
+
+- Parámetros Críticos:
+
+• --bias: Controla la varianza morfológica (los desplazamientos dx, dy). Un valor alto (ej. 3.0 o superior) reduce el tamaño de la
+distribución, forzando al modelo a elegir la trayectoria más probable y limpia, pero con riesgo de colapso modal. Un valor bajo
+(ej. 0.5) permite que la red explore distribuciones más amplias, introduciendo mayor aleatoriedad y variaciones orgánicas al trazo.
+
+• --pen_bias: Ajusta la sensibilidad de la cabeza lineal binaria. Interviene directamente en el umbral que decide cuándo el lápiz
+debe separarse del papel virtual.
+
+- Casos de uso para evaluación:
+
+• Validación morfológica + mapa de atención
+Evalúa el trazo generado y despliega el mapa de calor que muestra cómo el vector de gravedad del mecanismo Soft Attention avanza sobre los caracteres.
+// python -m src.generate --texto "escuela"
+
+• Auditoría de varianza
+Genera múltiples iteraciones probabilísticas de la misma palabra para comprobar la estabilidad morfológica del modelo.
+// python -m src.generate --texto "hola" --mode grid --n 9
+
+• Comparar comportamiento entre palabras
+Renderiza varias palabras simultáneas en un solo pase.
+// python -m src.generate --mode compare --textos "hola" "mundo" "España" "python"
+
+• SVG limpio para inspección vectorial
+Genera un archivo .svg estandarizado.
+python -m src.generate --texto "mundo" --svg
 
 ---
 
-## Problemas Documentados y Fixes Aplicados
+## Hardware utilizado
 
-### Colapso del MDN (época 190)
-**Causa:** `σmin` tocó el floor (`0.05`) de forma silenciosa durante ~150 épocas. Una Gaussiana muy estrecha domina la NLL, el optimizador concentra todo `π` en ese componente y `H(π)` colapsó a 0.21.
-
-**Fix:** `sigma_floor` elevado a `0.10`, `sigma_target_log` a `-1.4`, y regularización de entropía añadida a la loss. Adam reiniciado sin cargar `optimizer.state_dict()`.
-
-### Scheduler demasiado agresivo durante SS
-**Causa:** `ReduceLROnPlateau` no distingue entre "modelo divergiendo" y "ruido inherente del scheduled sampling". Redujo el LR cuatro veces en 30 épocas (1e-4 → 6.25e-6), congelando prácticamente el modelo.
-
-**Estado:** Pendiente de evaluar `CosineAnnealingLR` con margen suficiente de épocas.
-
-### Condición de parada en `generate()` inalcanzable
-**Causa:** El umbral `phi[-1] > 2.0` era correcto en el sanity check (sobreajuste extremo), pero en producción `phi_max ≈ 0.20`.
-
-**Fix actual:** Condición agnóstica a magnitud absoluta:
-```python
-phi_norm   = phi_vals / (phi_vals.sum() + 1e-8)
-last_ratio = phi_norm[-1].item()
-cond_phi   = last_ratio > phi_norm[:-1].max().item() and last_ratio > 0.6
-cond_len   = step > len(texto.replace(' ', '')) * 80
-```
-
----
-
-## Próximos Pasos
-
-1. **Reinicio desde época 0** con todas las correcciones integradas (~30 h estimadas a 3-4 min/época).
-2. Reducir MDN de `M=20` a `M=10` componentes — `H(π)` tardó 150 épocas en recuperarse del colapso; menos componentes reducen la presión sobre el optimizador.
-3. `pen_weight=12.0` desde el inicio para evitar la caída monotónica documentada en épocas 1–180.
-4. Añadir flag `--optimizer [y/n]` en `train.py` para decidir en terminal si cargar el estado del optimizador al reanudar.
-5. Evaluar `CosineAnnealingLR` como reemplazo de `ReduceLROnPlateau` para tolerar el ruido de SS.
-
----
-
-## Estructura de Archivos
-
-```
-.
-├── ujipenchars2.txt        # Dataset UJI Pen Characters v2
-├── words.txt               # Diccionario (819.392 palabras en español)
-├── UJIPen.py               # Dataset class: carga, síntesis, normalización, vectorización
-├── model.py                # Arquitectura: LSTM, SoftAttention, MDN, loss function
-├── train.py                # Loop de entrenamiento principal con scheduled sampling
-├── sanity_train.py         # Overfitting controlado sobre 2 muestras para validar arquitectura
-├── handwriting_model.pt    # Checkpoint del mejor modelo (época 191, loss=-2.5040)
-└── README.md               # Este archivo
-```
-
----
+- Asus Rog Zephyrus G15, Ryzen 9 6900HS, NVIDIA RTX 3060 Laptop GPU, vía WSL + CUDA.
 
 ## Referencia del Dataset
 
-> F. Prat, M. J. Castro, D. Llorens, A. Marzal, J. M. Vilar.
-> *UJIpenchars2: A Pen-Based Database with More Than 11K Isolated Handwritten Characters.*
-> Universitat Jaume I / Universidad Politécnica de Valencia, 2008.
+- UJIpenchars2: A Pen-Based Database with More Than 11K Isolated Handwritten Characters
+- F. Prat, M. J. Castro, D. Llorens, A. Marzal, J. M. Vilar.
+- Universitat Jaume I / Universidad Politécnica de Valencia, 2008.
+- <http://www.lrec-conf.org/proceedings/lrec2008/summaries/658.html>.

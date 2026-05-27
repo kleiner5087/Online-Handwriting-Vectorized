@@ -1,0 +1,44 @@
+INFORME TECNICO DE PROCESAMIENTO DE DATOS: UJIPEN.PY
+
+RESUMEN OPERATIVO
+El script UJIPen.py actua como el motor de preparacion de datos para un modelo generativo basado en vectores.
+Su funcion principal es tomar coordenadas absolutas de trazos manuscritos, ensamblarlas dinamicamente en palabras
+completas y transformarlas en secuencias de movimientos relativos, garantizando que los tensores resultantes esten
+estabilizados matematicamente para el entrenamiento.
+
+A continuación, se detalla el flujo de procesamiento de datos:
+
+1. Procesamiento Offline y Perfilado Físico
+Para optimizar el DataLoader y estandarizar el formato, se implementó un pipeline offline previo. 
+•	Submuestreo Temporal: Los trazos originales sufren una reducción estricta del 60% de sus puntos. Esto disminuye la 
+densidad a aproximadamente 23.7 puntos por letra, lo que evita desfasar la ventana de atención y empata la carga 
+temporal con las dinámicas de captura futuras (dataset personal). 
+• Migracion de formato del dataset: El resultado unificado del submuestreo se almacena en formato JSONL, dejando atrás
+la estructura txt original del dataset Ujipen para faclitar su lectura.
+•	Extracción de Métricas: Se calculó un diccionario topológico por cada escritor. Mediante un script se aíslaron letras 
+minúsculas cortas (sin ascendentes ni descendentes) para calcular la altura media (x-height) y la línea base exacta, 
+previniendo que los acentos, caracteres flotantes, asecendentes o descendentes afecten el promedio espacial del usuario.
+De tal manera se blindan los datos ante cualquier cualquier drift en el eje y.
+
+2. Ensamblado Dinámico en Tiempo de Entrenamiento
+El DataLoader no entrega palabras pre-calculadas, sino que construye cada muestra al vuelo para maximizar la entropía 
+sin corromper la morfología.
+•	Coherencia Single-Writer: Para mantener la integridad cinemática, las palabras sintéticas se ensamblan utilizando 
+exclusivamente caracteres de un solo autor al azar. 
+•	Aumento de Datos Geométrico: El sistema implementa un motor de aumento afín (inclinación, rotación, escalado uniforme o diferencial) 
+para generar variantes de un carácter cuando este se repite en una misma palabra, burlando la limitación original de dos 
+muestras por clase en el dataset. 
+•	Línea Base Inteligente: Se emplea un anclaje de línea base que reemplaza las heurísticas de alineación superior plana. 
+Para los caracteres descendentes (como 'g' o 'p'), el algoritmo empuja el límite inferior un 30 por ciento del alto de la 
+letra hacia el lado positivo, replicando la caída natural bajo el renglón de escritura. 
+
+3. Transformación Vectorial y Cinemática
+El paso final convierte las coordenadas cartesianas absolutas en las instrucciones secuenciales relativas (dx, dy, p) que consume el LSTM.
+•	Navegación Inter-carácter: Se eliminaron las ligaduras artificiales y los tokens de navegación espurios dentro de un mismo 
+carácter. El salto espacial codifica de forma pura el espaciado entre letras para evitar inestabilidad en la red de densidad de mezcla. 
+•	Filtrado de Degeneración Espacial: Los puntos redundantes donde el desplazamiento es inferior a tolerancias mínimas se omiten sin emitir un delta. 
+•	Gestión del Estado del Lápiz (Pen-Lift): La bandera lógica de levantamiento se inyecta en el último movimiento real de cada 
+trazo no final. La semántica de este vector indica explícitamente que se debe levantar la pluma inmediatamente después de ejecutar el movimiento. 
+•	Normalización Z Homologada: La desviación estándar de los deltas aumentó matemáticamente como efecto directo del diezmado, 
+pero al aplicar la división por esta constante empírica, las trayectorias se sitúan en un espacio latente escalar compatible con 
+las capturas proyectadas en la siguiente etapa del proyecto. 
