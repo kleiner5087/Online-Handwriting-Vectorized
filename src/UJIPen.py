@@ -11,12 +11,13 @@ INTERMEDIOS = set(";:<> -")
 UJI_CHARS = list("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789áéíóúÁÉÍÓÚñÑüÜ.,;:?!'\"()%-@$<>¿¡ºª€")
 
 class UJIDataset(Dataset):
-    def __init__(self, jsonl_path='./data/ujipenchars2.jsonl', baselines_path='./data/writer_baselines.json', words_path='./data/words.txt', epoch_size=10000, spacing=150):
+    def __init__(self, jsonl_path='./data/ujipenchars2.jsonl', baselines_path='./data/writer_baselines.json', words_path='./data/words2.txt', epoch_size=10000, spacing=150, is_val=False):
         self.epoch_size = epoch_size
         self.spacing = spacing
         self.uji_data = {}
         self.w_stats = {}
         self.vocabulario = []
+        self.is_val = is_val
 
         with open(baselines_path, 'r', encoding='utf-8') as f:
             self.w_stats = json.load(f)
@@ -35,18 +36,27 @@ class UJIDataset(Dataset):
 
         try:
             with open(words_path, 'r', encoding='utf-8-sig') as f:
-                todas = [w.strip() for w in f if w.strip()]
-            self.vocabulario = [w for w in todas if 1 <= len(w) <= 8]
+                self.vocabulario = [w.strip() for w in f if w.strip()]
         except Exception:
             self.vocabulario = []
 
         self.mean_dx, self.std_dx, self.mean_dy, self.std_dy = 0.0, 1.0, 0.0, 1.0
         self.mean_dx, self.std_dx, self.mean_dy, self.std_dy = self._compute_stats(2000)
 
+        self.val_cache = []
+        if self.is_val:
+            for _ in range(self.epoch_size):
+                word_points, texto = self._build_word_strokes()
+                deltas = self._strokes_to_deltas(word_points)
+                self.val_cache.append((torch.from_numpy(deltas), texto))
+
     def __len__(self):
         return self.epoch_size
 
     def __getitem__(self, idx):
+        if self.is_val:
+            return self.val_cache[idx]
+            
         word_points, texto = self._build_word_strokes()
         deltas = self._strokes_to_deltas(word_points)
         return torch.from_numpy(deltas), texto
@@ -65,16 +75,16 @@ class UJIDataset(Dataset):
         tipo = random.choice(['uniforme', 'diferencial_x', 'slant', 'rotacion'])
         
         if tipo == 'uniforme':
-            s = random.uniform(0.96, 1.04)
+            s = random.uniform(0.93, 1.07)
             M = np.array([[s, 0.0], [0.0, s]])
         elif tipo == 'diferencial_x':
-            sx = random.uniform(0.97, 1.03)
+            sx = random.uniform(0.94, 1.06)
             M = np.array([[sx, 0.0], [0.0, 1.0]])
         elif tipo == 'slant':
-            sh = random.uniform(-0.15, 0.15)
+            sh = random.uniform(-0.22, 0.22)
             M = np.array([[1.0, sh], [0.0, 1.0]])
         else:
-            ang = math.radians(random.uniform(-1.5, 1.5))
+            ang = math.radians(random.uniform(-3.0, 3.0))
             c, s = math.cos(ang), math.sin(ang)
             M = np.array([[c, -s], [s, c]])
             
@@ -93,10 +103,10 @@ class UJIDataset(Dataset):
         w_id = random.choice(self.escritores_validos)
         x_height = self.w_stats[w_id]["x_height"]
         
-        if self.vocabulario and random.random() < 0.70:
+        if random.random() < 0.70:
             texto = random.choice(self.vocabulario)
         else:
-            length = random.randint(3, 9)
+            length = random.randint(3, 10)
             texto = "".join(random.choices(UJI_CHARS, k=length))
 
         word_points = []
@@ -115,6 +125,8 @@ class UJIDataset(Dataset):
                 sample_trazos = variantes[count - 1]['strokes']
             else:
                 sample_trazos = random.choice(variantes)['strokes']
+            
+            if random.random() < 0.75:
                 sample_trazos = self.aplicar_transformacion_afin(sample_trazos)
             
             all_xs = [p[0] for st in sample_trazos for p in st]
@@ -143,6 +155,7 @@ class UJIDataset(Dataset):
             
             cursor_x += (max_x - min_x) + self.spacing
 
+        texto = texto + "#"
         return word_points, texto
 
     def _strokes_to_deltas(self, word_points):
@@ -154,7 +167,6 @@ class UJIDataset(Dataset):
             return np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
 
         for s_idx, trazo in enumerate(valid_strokes):
-            is_ultimo_trazo = (s_idx == len(valid_strokes) - 1)
             stroke_deltas = []
 
             if global_last_x is not None:
@@ -179,13 +191,13 @@ class UJIDataset(Dataset):
             if not stroke_deltas:
                 continue
 
-            if not is_ultimo_trazo:
-                stroke_deltas[-1][2] = 1.0
-
+            stroke_deltas[-1][2] = 1.0
             deltas.extend(stroke_deltas)
 
         if not deltas:
             return np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+
+        deltas.append([float(self.spacing), 0.0, 0.0])
 
         if deltas[0][2] == 1.0:
             deltas[0][2] = 0.0
