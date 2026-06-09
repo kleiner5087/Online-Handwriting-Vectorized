@@ -34,7 +34,6 @@ def load_checkpoint(ckpt_path: str, device: torch.device):
     }
     return model, stats
 
-
 @torch.no_grad()
 def generate_deltas(
     model:          HandwritingGenerator,
@@ -49,6 +48,9 @@ def generate_deltas(
     if seed is not None:
         torch.manual_seed(seed)
         np.random.seed(seed)
+
+    if not texto.endswith('#'):
+        texto = texto + '#'
 
     char_embeds = model.char_embed(model.encode_text([texto], device))
     U           = char_embeds.shape[1]
@@ -70,9 +72,7 @@ def generate_deltas(
         o1          = model.norm1(o1.squeeze(1))
         window, phi = model.attention(o1, char_embeds)
 
-        phi_n      = phi.squeeze(0) / (phi.squeeze(0).sum() + 1e-8)
-        last_ratio = phi_n[-1].item()
-        if len(phi_n) > 1 and last_ratio > phi_n[:-1].max().item() and last_ratio > 0.6:
+        if torch.argmax(phi.squeeze(0)).item() == U - 1:
             stop_reason = 'phi'
             break
         if step > expected:
@@ -104,7 +104,6 @@ def generate_deltas(
     )
     return strokes, attentions, stop_reason
 
-
 def deltas_to_strokes(
     deltas:  np.ndarray,
     std_dx:  float,
@@ -112,22 +111,17 @@ def deltas_to_strokes(
     mean_dx: float,
     mean_dy: float,
 ) -> list[np.ndarray]:
-    # Extraemos deltas reales omitiendo el token SOS inicial
+
     dx  = deltas[1:, 0]
     dy  = deltas[1:, 1]
     pen = deltas[1:, 2]
 
-    # Desnormalización Z
     abs_dx = dx * std_dx + mean_dx
     abs_dy = dy * std_dy + mean_dy
 
-    # REGLA CRÍTICA: Añadir explícitamente el origen absoluto (0.0, 0.0) 
-    # antes de la suma acumulada para que no se pierda el primer nodo del trazo inicial.
     abs_x = np.concatenate(([0.0], np.cumsum(abs_dx)))
     abs_y = np.concatenate(([0.0], np.cumsum(abs_dy)))
     
-    # El bit de `pen` de un delta indica: "levanta el lápiz DESPUÉS de ejecutar este movimiento".
-    # Desplazamos la señal un paso rellenando con 0.0 al inicio para alinear con los tensores de coordenadas.
     pen = np.concatenate(([0.0], pen))
 
     strokes = []
@@ -137,18 +131,13 @@ def deltas_to_strokes(
     for x, y, p in zip(abs_x, abs_y, pen):
         cur_x.append(float(x))
         cur_y.append(float(y))
-        
-        # Segmentación mecánica:
-        # El lápiz llegó a la coordenada actual y p > 0.5 indica que corta la continuidad.
+
         if p > 0.5:
             if len(cur_x) >= 2:
                 strokes.append(np.column_stack([cur_x, cur_y]))
-            # Vaciamos la memoria temporal. El SIGUIENTE paso iterativo (el salto de navegación)
-            # se añadirá a listas vacías, definiendo su nuevo origen topológico sin trazar puentes fantasma.
             cur_x = []
             cur_y = []
 
-    # Recoger el remanente si el último trazo no tenía señal de finalización explícita
     if len(cur_x) >= 2:
         strokes.append(np.column_stack([cur_x, cur_y]))
 
@@ -309,12 +298,12 @@ def mode_single(args, model, stats, device):
         )
         ax_attn.set_ylabel('char', fontsize=7)
         ax_attn.set_xlabel('paso', fontsize=7)
-        ax_attn.set_yticks(range(len(args.texto)))
-        ax_attn.set_yticklabels(list(args.texto), fontsize=7)
+        ax_attn.set_yticks(range(len(args.texto) + 1))
+        ax_attn.set_yticklabels(list(args.texto) + ['#'], fontsize=7)
         ax_attn.tick_params(labelsize=6)
 
     out_base = _out_base(args, args.texto)
-    fig.savefig(out_base + '.png', dpi=args.dpi, bbox_inches='tight',
+    fig.savefig("texto" + '.png', dpi=args.dpi, bbox_inches='tight',
                 facecolor=BG_COLOR)
     plt.close(fig)
 
@@ -417,7 +406,7 @@ def _out_base(args, slug: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
-    p.add_argument('--checkpoint',      default='./modelos/model8.pt')
+    p.add_argument('--checkpoint',      default='./modelos/model12.pt')
     p.add_argument('--texto',           default='hola')
     p.add_argument('--textos',          nargs='+', default=None)
     p.add_argument('--bias',            type=float, default=3.5)
@@ -425,7 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--mode',            choices=['single', 'grid', 'compare'],
                    default='single')
     p.add_argument('--n',               type=int, default=9)
-    p.add_argument('--steps_per_char',  type=int, default=120)
+    p.add_argument('--steps_per_char',  type=int, default=100)
     p.add_argument('--max_steps',       type=int, default=2000)
     p.add_argument('--seed',            type=int, default=4)
     p.add_argument('--no_attn',         action='store_true')
