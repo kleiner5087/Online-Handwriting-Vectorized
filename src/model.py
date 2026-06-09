@@ -8,8 +8,8 @@ STROKE_DIM  = 3
 HIDDEN_SIZE = 512
 EMBED_DIM   = 64
 K_ATTN      = 10
-M_MDN       = 10
-DELTA_MAX   = 0.05
+M_MDN       = 6
+DELTA_MAX   = 0.04
 
 
 class SoftAttentionWindow(nn.Module):
@@ -73,11 +73,16 @@ class HandwritingGenerator(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_size)
         self.norm2 = nn.LayerNorm(hidden_size)
 
+        self.drop1 = nn.Dropout(p=0.20)
+        self.drop2 = nn.Dropout(p=0.20)
+
         self.mdn_head = nn.Linear(hidden_size * 2 + embed_dim, M * 6)
         self.pen_head = nn.Sequential(
-            nn.Linear(hidden_size * 2 + embed_dim, 128),
+            nn.Linear(hidden_size * 2 + embed_dim, 192),
             nn.ReLU(),
-            nn.Linear(128, 1),
+            nn.Linear(192, 192),
+            nn.ReLU(),
+            nn.Linear(192, 1),
         )
         self._init_weights()
 
@@ -87,8 +92,10 @@ class HandwritingGenerator(nn.Module):
         nn.init.xavier_uniform_(self.pen_head[0].weight)
         nn.init.zeros_(self.pen_head[0].bias)
         nn.init.xavier_uniform_(self.pen_head[2].weight)
+        nn.init.zeros_(self.pen_head[2].bias)
+        nn.init.xavier_uniform_(self.pen_head[4].weight)
         with torch.no_grad():
-            self.pen_head[2].bias.data.fill_(-3.0)
+            self.pen_head[4].bias.data.fill_(-3.0)
 
     def _zero_hidden(self, batch: int, device: torch.device):
         z = torch.zeros(1, batch, self.hidden_size, device=device)
@@ -121,12 +128,12 @@ class HandwritingGenerator(nn.Module):
 
             inp1      = torch.cat([x_t, window], dim=1).unsqueeze(1)
             o1, h1    = self.lstm1(inp1, h1)
-            o1        = self.norm1(o1.squeeze(1))
+            o1        = self.drop1(self.norm1(o1.squeeze(1)))
             window, _ = self.attention(o1, char_embeds)
 
             inp2   = torch.cat([x_t, window, o1], dim=1).unsqueeze(1)
             o2, h2 = self.lstm2(inp2, h2)
-            o2     = self.norm2(o2.squeeze(1))
+            o2     = self.drop2(self.norm2(o2.squeeze(1)))
 
             outs.append(torch.cat([o1, o2, window], dim=1))
 
@@ -136,7 +143,7 @@ class HandwritingGenerator(nn.Module):
         return torch.cat([mdn_params, pen_logits], dim=-1)
 
 
-def parse_mdn_params(params: torch.Tensor, M: int = M_MDN, bias: float = 0.0):
+def parse_mdn_params(params: torch.Tensor, M: int = M_MDN, bias: float = 0.0, s_min: float = 0.05):
     pi_raw  = params[..., :M]
     mu_x    = params[..., M     : 2 * M]
     mu_y    = params[..., 2 * M : 3 * M]
@@ -146,8 +153,8 @@ def parse_mdn_params(params: torch.Tensor, M: int = M_MDN, bias: float = 0.0):
     e_raw   = params[..., -1]
 
     pi      = F.softmax(pi_raw * (1.0 + bias), dim=-1)
-    sigma_x = F.softplus(s_x_raw - bias) + 0.05
-    sigma_y = F.softplus(s_y_raw - bias) + 0.05
+    sigma_x = F.softplus(s_x_raw - bias) + s_min
+    sigma_y = F.softplus(s_y_raw - bias) + s_min
     rho     = torch.tanh(rho_raw)
     e       = torch.sigmoid(e_raw)
     return pi, mu_x, mu_y, sigma_x, sigma_y, rho, e
@@ -178,8 +185,9 @@ def mdn_loss(
     mask:       torch.Tensor,
     M:          int   = M_MDN,
     pen_weight: float = 1.5,
+    s_min:      float = 0.05,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    pi, mu_x, mu_y, sigma_x, sigma_y, rho, _ = parse_mdn_params(mdn_params, M)
+    pi, mu_x, mu_y, sigma_x, sigma_y, rho, _ = parse_mdn_params(mdn_params, M, s_min=s_min)
 
     dx       = targets[..., 0:1]
     dy       = targets[..., 1:2]
@@ -212,10 +220,11 @@ def sample_from_mdn(
     params: torch.Tensor,
     M:      int   = M_MDN,
     bias:   float = 0.0,
+    s_min:  float = 0.05,
 ) -> torch.Tensor:
     if params.dim() == 1:
         params = params.unsqueeze(0)
-    return sample_from_mdn_batch(params, M, bias).squeeze(0)
+    return sample_from_mdn_batch(params, M, bias, s_min).squeeze(0)
 
 
 @torch.no_grad()
@@ -223,8 +232,9 @@ def sample_from_mdn_batch(
     params: torch.Tensor,
     M:      int   = M_MDN,
     bias:   float = 0.0,
+    s_min:  float = 0.05,
 ) -> torch.Tensor:
-    pi, mu_x, mu_y, sigma_x, sigma_y, rho, e = parse_mdn_params(params, M, bias)
+    pi, mu_x, mu_y, sigma_x, sigma_y, rho, e = parse_mdn_params(params, M, bias, s_min)
     B = params.shape[0]
 
     k   = torch.multinomial(pi, num_samples=1).squeeze(1)
