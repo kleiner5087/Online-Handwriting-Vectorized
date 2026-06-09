@@ -12,21 +12,20 @@ from src.model import HandwritingGenerator, mdn_loss, parse_mdn_params, sample_f
 
 SEED            = 42
 BATCH_SIZE      = 64
-EPOCHS          = 3000
-LR              = 5e-5
+EPOCHS          = 2000
+LR              = 1e-4
 EPOCH_SIZE      = 1000
-SAVE_PATH       = './modelos/model8.pt'
+SAVE_PATH       = './modelos/model14.pt'
 RESUME          = True
 
 SS_WARMUP       = 0
-SS_MIN          = 0.75
+SS_MIN          = 0.55
 
-PEN_WEIGHT      = 1.5
+PEN_WEIGHT      = 2.0
 CLIP            = 3.0
 TBPTT_K         = 15
 T_MAX_TRAIN     = 350
 TRUE_PEN_RATE   = 0.0535
-INPUT_NOISE_STD = 0.03
 
 LOG_EVERY     = 25
 USE_AMP       = False
@@ -40,12 +39,11 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark     = False
+    torch.backends.cudnn.benchmark     = True
 
 
 def build_vocab(dataset):
-    chars = set()
+    chars = set(['#'])
     for writer_chars in dataset.uji_data.values():
         chars.update(writer_chars.keys())
     return {ch: i for i, ch in enumerate(sorted(chars))}
@@ -65,12 +63,20 @@ def collate_fn(batch):
     return torch.from_numpy(padded), torch.from_numpy(mask), list(labels)
 
 
-def get_teacher_ratio(actual_epoch):
-    x = 0.75
-    return x
+def get_teacher_ratio(actual_epoch, decay_epochs=600):
+    if actual_epoch >= decay_epochs:
+        return SS_MIN
+    return 1.0 - (1.0 - SS_MIN) * (actual_epoch / decay_epochs)
+
+def get_dynamic_params(epoch):
+    if epoch > 800:
+        return 0.06, 0.03
+    s_min = 0.15 - (0.15 - 0.06) * (epoch / 800.0)
+    sigma = 0.05 - (0.05 - 0.03) * (epoch / 800.0)
+    return s_min, sigma
 
 
-def forward_tbptt(model, strokes, texts, device, teacher_ratio):
+def forward_tbptt(model, strokes, texts, device, teacher_ratio, noise_std, s_min):
     B, T, _ = strokes.shape
 
     char_idx    = model.encode_text(texts, device)
@@ -90,8 +96,8 @@ def forward_tbptt(model, strokes, texts, device, teacher_ratio):
             window = window.detach()
             model.attention.kappa = model.attention.kappa.detach()
 
-        if INPUT_NOISE_STD > 0.0:
-            noise       = torch.randn(B, 2, device=device) * INPUT_NOISE_STD
+        if noise_std > 0.0:
+            noise       = torch.randn(B, 2, device=device) * noise_std
             x_t_noisy   = x_t.clone()
             x_t_noisy[:, :2] = x_t[:, :2] + noise
         else:
@@ -99,12 +105,12 @@ def forward_tbptt(model, strokes, texts, device, teacher_ratio):
 
         inp1      = torch.cat([x_t_noisy, window], dim=1).unsqueeze(1)
         o1, h1    = model.lstm1(inp1, h1)
-        o1        = model.norm1(o1.squeeze(1))
+        o1        = model.drop1(model.norm1(o1.squeeze(1)))
         window, _ = model.attention(o1, char_embeds)
 
         inp2   = torch.cat([x_t_noisy, window, o1], dim=1).unsqueeze(1)
         o2, h2 = model.lstm2(inp2, h2)
-        o2     = model.norm2(o2.squeeze(1))
+        o2     = model.drop2(model.norm2(o2.squeeze(1)))
 
         features = torch.cat([o1, o2, window], dim=1)
         params_t = torch.cat([model.mdn_head(features), model.pen_head(features)], dim=-1)
@@ -114,7 +120,7 @@ def forward_tbptt(model, strokes, texts, device, teacher_ratio):
             x_t = strokes[:, t + 1, :]
         else:
             use_teacher   = torch.rand(B, device=device) < teacher_ratio
-            sampled       = sample_from_mdn_batch(params_t.detach(), M=model.M, bias=0.5)
+            sampled       = sample_from_mdn_batch(params_t.detach(), M=model.M, bias=0.5, s_min=s_min)
             sampled[:, 2] = 0.0
             x_t_xy        = torch.where(
                 use_teacher.unsqueeze(1),
@@ -181,11 +187,11 @@ def collect_debug(params, target, mask, model, texts):
                 bce_raw=bce_raw, enorm_mean=enorm_mean)
 
 
-def train_epoch(model, loader, optimizer, scaler, device, teacher_ratio, collect):
+def train_epoch(model, loader, optimizer, scaler, device, teacher_ratio, noise_std, s_min, collect):
     model.train()
 
     tot_loss = 0.0
-    m_smin, m_grad, m_Hpi, m_nll_s, m_nll_g = [], [], [], [], []
+    m_smin, m_grad_base, m_grad_mdn, m_grad_pen, m_Hpi, m_nll_s, m_nll_g = [], [], [], [], [], [], []
     debug_acc = []
 
     for batch_idx, (strokes, mask, texts) in enumerate(loader):
@@ -195,13 +201,14 @@ def train_epoch(model, loader, optimizer, scaler, device, teacher_ratio, collect
         optimizer.zero_grad()
 
         with torch.cuda.amp.autocast(enabled=USE_AMP):
-            params = forward_tbptt(model, strokes, texts, device, teacher_ratio)
+            params = forward_tbptt(model, strokes, texts, device, teacher_ratio, noise_std, s_min)
             target = strokes[:, 1:, :]
             t_mask = mask[:, 1:]
 
             loss, nll, nll_stroke = mdn_loss(
                 params, target, t_mask,
                 pen_weight=PEN_WEIGHT,
+                s_min=s_min
             )
 
         if not torch.isfinite(loss):
@@ -210,17 +217,24 @@ def train_epoch(model, loader, optimizer, scaler, device, teacher_ratio, collect
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), CLIP)
+        
+        base_params = [p for n, p in model.named_parameters() if 'mdn_head' not in n and 'pen_head' not in n]
+        grad_base = nn.utils.clip_grad_norm_(base_params, CLIP)
+        grad_mdn  = nn.utils.clip_grad_norm_(model.mdn_head.parameters(), CLIP)
+        grad_pen  = nn.utils.clip_grad_norm_(model.pen_head.parameters(), CLIP)
+
         scaler.step(optimizer)
         scaler.update()
 
         tot_loss += loss.item()
         m_nll_s.append(nll_stroke.item())
         m_nll_g.append(nll.item())
-        m_grad.append(grad_norm.item())
+        m_grad_base.append(grad_base.item())
+        m_grad_mdn.append(grad_mdn.item())
+        m_grad_pen.append(grad_pen.item())
 
         with torch.no_grad():
-            pi, _, _, sx, _, _, _ = parse_mdn_params(params.detach())
+            pi, _, _, sx, _, _, _ = parse_mdn_params(params.detach(), s_min=s_min)
             m_smin.append(sx.min().item())
             m_Hpi.append(-(pi * torch.log(pi + 1e-8)).sum(-1).mean().item())
 
@@ -234,32 +248,70 @@ def train_epoch(model, loader, optimizer, scaler, device, teacher_ratio, collect
         agg_debug = {k: float(np.nanmean([d[k] for d in debug_acc])) for k in keys}
 
     metrics = dict(
-        nll_s = float(np.mean(m_nll_s)),
-        nll_g = float(np.mean(m_nll_g)),
-        smin  = float(np.mean(m_smin)),
-        grad  = float(np.mean(m_grad)),
-        Hpi   = float(np.mean(m_Hpi)),
-        loss  = tot_loss / max(len(loader), 1),
-        debug = agg_debug,
+        nll_s     = float(np.mean(m_nll_s)),
+        nll_g     = float(np.mean(m_nll_g)),
+        smin      = float(np.mean(m_smin)),
+        grad_base = float(np.mean(m_grad_base)),
+        grad_mdn  = float(np.mean(m_grad_mdn)),
+        grad_pen  = float(np.mean(m_grad_pen)),
+        Hpi       = float(np.mean(m_Hpi)),
+        loss      = tot_loss / max(len(loader), 1),
+        debug     = agg_debug,
     )
     return metrics
 
 
-CSV_HEADER = 'ep,tf,nll_s,nll_g,loss,smin,grad,Hpi,bce,sep,prec,rec,pred_x,naz,p90n,fp_iso,kap_ov,enorm_mean'
+@torch.no_grad()
+def validate_epoch(model, loader, device, s_min):
+    model.eval()
+    tot_loss = 0.0
+    m_nll_s, m_nll_g = [], []
+
+    for strokes, mask, texts in loader:
+        strokes = strokes.to(device, non_blocking=True)
+        mask    = mask.to(device,    non_blocking=True)
+
+        with torch.cuda.amp.autocast(enabled=USE_AMP):
+            params = forward_tbptt(model, strokes, texts, device, teacher_ratio=1.0, noise_std=0.0, s_min=s_min)
+            target = strokes[:, 1:, :]
+            t_mask = mask[:, 1:]
+
+            loss, nll, nll_stroke = mdn_loss(
+                params, target, t_mask,
+                pen_weight=PEN_WEIGHT,
+                s_min=s_min
+            )
+
+        if torch.isfinite(loss):
+            tot_loss += loss.item()
+            m_nll_s.append(nll_stroke.item())
+            m_nll_g.append(nll.item())
+
+    return dict(
+        nll_s = float(np.mean(m_nll_s)) if m_nll_s else float('inf'),
+        nll_g = float(np.mean(m_nll_g)) if m_nll_g else float('inf'),
+        loss  = tot_loss / max(len(loader), 1)
+    )
+
+
+CSV_HEADER = 'ep,tf,val_nll_s,nll_s,nll_g,loss,smin,grad_b,grad_m,grad_p,Hpi,bce,sep,prec,rec,pred_x,naz,p90n,fp_iso,kap_ov,enorm_mean'
 
 def _f(v, d=4):
     return f'{v:.{d}f}' if (isinstance(v, float) and not np.isnan(v)) else 'nan'
 
-def log_csv(epoch, tf, metrics, log_file):
+def log_csv(epoch, tf, metrics, val_metrics, log_file):
     d = metrics.get('debug') or {}
     row = ','.join([
         str(epoch),
         _f(tf, 2),
+        _f(val_metrics['nll_s']),
         _f(metrics['nll_s']),
         _f(metrics['nll_g']),
         _f(metrics['loss']),
         _f(metrics['smin']),
-        _f(metrics['grad'], 2),
+        _f(metrics['grad_base'], 2),
+        _f(metrics['grad_mdn'], 2),
+        _f(metrics['grad_pen'], 2),
         _f(metrics['Hpi'], 2),
         _f(d.get('bce_raw',    float('nan'))),
         _f(d.get('sep',        float('nan'))),
@@ -277,6 +329,7 @@ def log_csv(epoch, tf, metrics, log_file):
 
 
 def main():
+    import json
     set_seed(SEED)
     from src.UJIPen import UJIDataset
 
@@ -284,19 +337,37 @@ def main():
     os.makedirs(DEBUG_DIR, exist_ok=True)
     print(f'Device: {DEVICE}')
 
-    dataset = UJIDataset(
+    with open('./data/writer_subset.json', 'r', encoding='utf-8') as f:
+        writer_subset = json.load(f)
+    
+    train_writers = [w for w, s in writer_subset.items() if s == 'train']
+    test_writers  = [w for w, s in writer_subset.items() if s == 'test']
+
+    train_dataset = UJIDataset(
         jsonl_path='./data/ujipenchars2.jsonl',
         baselines_path='./data/writer_baselines.json',
         words_path='./data/words.txt',
         epoch_size=EPOCH_SIZE,
     )
+    train_dataset.escritores_validos = [w for w in train_dataset.escritores_validos if w in train_writers]
 
-    char_vocab  = build_vocab(dataset)
-    model       = HandwritingGenerator(char_vocab).to(DEVICE)
-    optimizer   = torch.optim.Adam(model.parameters(), lr=LR)
-    scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(EPOCHS - SS_WARMUP, 1), eta_min=5e-6
+    val_dataset = UJIDataset(
+        jsonl_path='./data/ujipenchars2.jsonl',
+        baselines_path='./data/writer_baselines.json',
+        words_path='./data/words.txt',
+        epoch_size=EPOCH_SIZE,
+        is_val=True
     )
+    val_dataset.escritores_validos = [w for w in val_dataset.escritores_validos if w in test_writers]
+
+    char_vocab  = build_vocab(train_dataset)
+    model       = HandwritingGenerator(char_vocab).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+    
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=400, T_mult=2, eta_min=5e-6
+    )
+
     scaler      = torch.cuda.amp.GradScaler(enabled=USE_AMP)
     start_epoch = 1
     best_nll    = float('inf')
@@ -308,7 +379,7 @@ def main():
             print(f'  Pesos no cargados (nuevos): {missing}')
         start_epoch = ckpt['epoch'] + 1
         best_nll    = ckpt.get('best_nll', float('inf'))
- 
+
         ans = input('¿Cargar optimizer? [y/n]: ').strip().lower()
         if ans == 'y' and 'optimizer' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer'])
@@ -320,11 +391,25 @@ def main():
             with torch.no_grad():
                 K = model.attention.K
                 model.attention.proj.bias[2 * K:].fill_(-3.0)
+
+        if 'rng_torch' in ckpt:
+            torch.set_rng_state(ckpt['rng_torch'])
+            if ckpt.get('rng_cuda') is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(ckpt['rng_cuda'])
+            np.random.set_state(ckpt['rng_numpy'])
+            random.setstate(ckpt['rng_python'])
+            print('  Estados RNG restaurados globalmente.')
     else:
         print('  Sin checkpoint. Iniciando desde cero.')
 
-    loader = DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True,
+    train_loader = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+        collate_fn=collate_fn, num_workers=0,
+        pin_memory=(DEVICE.type == 'cuda'), persistent_workers=False,
+    )
+
+    val_loader = DataLoader(
+        val_dataset, batch_size=BATCH_SIZE, shuffle=False,
         collate_fn=collate_fn, num_workers=0,
         pin_memory=(DEVICE.type == 'cuda'), persistent_workers=False,
     )
@@ -336,14 +421,17 @@ def main():
     print(CSV_HEADER)
 
     for local_ep in range(1, EPOCHS + 1):
-        actual_ep     = start_epoch + local_ep - 1
+        actual_ep = start_epoch + local_ep - 1
         teacher_ratio = get_teacher_ratio(actual_ep)
-        do_collect    = (local_ep % LOG_EVERY == 0 or local_ep == 1)
+        s_min, noise_std = get_dynamic_params(actual_ep)
+        do_collect = (local_ep % LOG_EVERY == 0 or local_ep == 1)
 
         metrics = train_epoch(
-            model, loader, optimizer, scaler, DEVICE,
-            teacher_ratio, do_collect,
+            model, train_loader, optimizer, scaler, DEVICE,
+            teacher_ratio, noise_std, s_min, do_collect,
         )
+
+        val_metrics = validate_epoch(model, val_loader, DEVICE, s_min)
 
         if actual_ep > SS_WARMUP:
             scheduler.step()
@@ -351,15 +439,18 @@ def main():
         d = metrics.get('debug') or {}
 
         if do_collect:
-            log_csv(actual_ep, teacher_ratio, metrics, log_file)
+            log_csv(actual_ep, teacher_ratio, metrics, val_metrics, log_file)
             print(','.join([
                 str(actual_ep),
                 f'{teacher_ratio:.2f}',
+                f'{val_metrics["nll_s"]:.4f}',
                 f'{metrics["nll_s"]:.4f}',
                 f'{metrics["nll_g"]:.4f}',
                 f'{metrics["loss"]:.4f}',
                 f'{metrics["smin"]:.3f}',
-                f'{metrics["grad"]:.1f}',
+                f'{metrics["grad_base"]:.1f}',
+                f'{metrics["grad_mdn"]:.1f}',
+                f'{metrics["grad_pen"]:.1f}',
                 f'{metrics["Hpi"]:.2f}',
                 f'{d.get("bce_raw",    float("nan")):.4f}',
                 f'{d.get("sep",        float("nan")):.3f}',
@@ -373,21 +464,25 @@ def main():
                 f'{d.get("enorm_mean", float("nan")):.3f}',
             ]))
 
-        if metrics['nll_s'] < best_nll:
-            best_nll = metrics['nll_s']
+        if val_metrics['nll_s'] < best_nll:
+            best_nll = val_metrics['nll_s']
             torch.save({
                 'epoch':      actual_ep,
-                'loss':       metrics['loss'],
+                'loss':       val_metrics['loss'],
                 'best_nll':   best_nll,
                 'state_dict': model.state_dict(),
                 'optimizer':  optimizer.state_dict(),
                 'char_vocab': char_vocab,
-                'std_dx':     dataset.std_dx,
-                'std_dy':     dataset.std_dy,
-                'mean_dx':    dataset.mean_dx,
-                'mean_dy':    dataset.mean_dy,
+                'std_dx':     train_dataset.std_dx,
+                'std_dy':     train_dataset.std_dy,
+                'mean_dx':    train_dataset.mean_dx,
+                'mean_dy':    train_dataset.mean_dy,
+                'rng_torch':  torch.get_rng_state(),
+                'rng_cuda':   torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                'rng_numpy':  np.random.get_state(),
+                'rng_python': random.getstate(),
             }, SAVE_PATH)
-            print(f'  ✓ ep={actual_ep}  nll_s={best_nll:.4f}')
+            print(f'  ✓ ep={actual_ep}  val_nll_s={best_nll:.4f}')
 
     print(f'\nFin. Log: {log_file}')
 
